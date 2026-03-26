@@ -1,0 +1,6607 @@
+from __future__ import annotations
+
+import os
+import re
+import json
+import html
+import hashlib
+import csv
+import io
+import logging
+import threading
+import sqlite3
+import time
+import openpyxl
+from urllib.parse import urlparse, parse_qs, unquote_plus
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, List, Tuple
+
+import pathlib
+
+import requests
+from flask import Flask, request, jsonify, abort, render_template_string, redirect, Response
+
+# ----------------------------
+# Markdown → HTML (with fallbacks)
+# ----------------------------
+try:
+    import markdown as _md
+    def _md_to_html(text: str) -> str:
+        return _md.markdown(text, extensions=["tables", "fenced_code"])
+except ImportError:
+    try:
+        import mistune
+        def _md_to_html(text: str) -> str:
+            return mistune.html(text)
+    except ImportError:
+        import html as _html_mod
+        def _md_to_html(text: str) -> str:
+            return "<pre class='wrap-any p-3'>" + _html_mod.escape(text) + "</pre>"
+
+# ----------------------------
+# Load .env (dev)
+# ----------------------------
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
+# ----------------------------
+# Logging with secret masking
+# ----------------------------
+SENSITIVE_ENV_KEYS = {"ESCAVADOR_TOKEN", "WEBHOOK_AUTH_TOKEN"}
+
+
+def _mask(s: str) -> str:
+    if not s:
+        return s
+    if len(s) <= 12:
+        return "*" * len(s)
+    return s[:6] + "…" + s[-6:]
+
+
+def redact_secrets(text: str) -> str:
+    if not text:
+        return text
+    out = text
+    for k in SENSITIVE_ENV_KEYS:
+        v = os.getenv(k, "")
+        if v:
+            out = out.replace(v, _mask(v))
+    out = re.sub(r"Bearer\s+[A-Za-z0-9\-\._]+", "Bearer ***", out)
+    return out
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        msg = super().format(record)
+        return redact_secrets(msg)
+
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+handler = logging.StreamHandler()
+handler.setFormatter(RedactingFormatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger = logging.getLogger("escavador_monitor")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+logger.handlers.clear()
+logger.addHandler(handler)
+logger.propagate = False
+
+# ----------------------------
+# Config
+# ----------------------------
+ESCAVADOR_BASE = os.getenv("ESCAVADOR_BASE", "https://api.escavador.com/api/v2").rstrip("/")
+ESCAVADOR_TOKEN = os.getenv("ESCAVADOR_TOKEN", "").strip()
+WEBHOOK_AUTH_TOKEN = os.getenv("WEBHOOK_AUTH_TOKEN", "").strip()
+
+DB_PATH = os.getenv("DB_PATH", "./escavador_monitor.db")
+DB_PATH_ABS = os.path.abspath(DB_PATH)
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
+AUTO_DISCOVER_ENABLED = os.getenv("AUTO_DISCOVER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+DISCOVER_INTERVAL_SECONDS = int(os.getenv("DISCOVER_INTERVAL_SECONDS", "3600"))
+DISCOVER_LIMIT_PER_DOC = int(os.getenv("DISCOVER_LIMIT_PER_DOC", "50"))
+DISCOVER_ONLY_IF_NO_LINKS = os.getenv("DISCOVER_ONLY_IF_NO_LINKS", "1").strip().lower() in ("1", "true", "yes", "on")
+DISCOVER_MAX_DOCS_PER_CYCLE = int(os.getenv("DISCOVER_MAX_DOCS_PER_CYCLE", "50"))
+CAPA_CACHE_TTL_SECONDS = int(os.getenv("CAPA_CACHE_TTL_SECONDS", "86400"))  # 1 dia
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "5000"))
+
+logger.info("DB configured: %s | abs=%s | cwd=%s", DB_PATH, DB_PATH_ABS, os.getcwd())
+
+# ----------------------------
+# Auto-discover runtime status (last cycle, manual trigger, etc.)
+# ----------------------------
+DISCOVER_STATE_LOCK = threading.Lock()
+DISCOVER_STATE: Dict[str, Any] = {
+    "running": False,
+    "last_trigger": None,          # "auto" | "manual"
+    "last_started": None,          # ISO UTC
+    "last_finished": None,         # ISO UTC
+    "last_totals": None,           # dict totals
+    "last_error": None,            # str
+}
+
+def _set_discover_state(**kwargs: Any) -> None:
+    with DISCOVER_STATE_LOCK:
+        for k, v in kwargs.items():
+            DISCOVER_STATE[k] = v
+
+def _get_discover_state() -> Dict[str, Any]:
+    with DISCOVER_STATE_LOCK:
+        return dict(DISCOVER_STATE)
+
+# ----------------------------
+# Poll runtime status (last cycle, last totals, last error)
+# ----------------------------
+POLL_STATE_LOCK = threading.Lock()
+POLL_STATE: Dict[str, Any] = {
+    "running": False,
+    "last_started": None,    # ISO UTC
+    "last_finished": None,   # ISO UTC
+    "last_totals": None,     # dict totals
+    "last_error": None,      # str
+}
+
+def _set_poll_state(**kwargs: Any) -> None:
+    with POLL_STATE_LOCK:
+        for k, v in kwargs.items():
+            POLL_STATE[k] = v
+
+def _get_poll_state() -> Dict[str, Any]:
+    with POLL_STATE_LOCK:
+        return dict(POLL_STATE)
+
+# ----------------------------
+# Last Escavador API error (observability)
+# ----------------------------
+API_ERROR_LOCK = threading.Lock()
+LAST_API_ERROR: Dict[str, Any] = {
+    "at": None,        # ISO UTC
+    "method": None,
+    "path": None,
+    "status": None,
+    "message": None,
+}
+
+def _set_last_api_error(method: str, path: str, status: Optional[int], message: str) -> None:
+    with API_ERROR_LOCK:
+        LAST_API_ERROR["at"] = utcnow_iso()
+        LAST_API_ERROR["method"] = method
+        LAST_API_ERROR["path"] = path
+        LAST_API_ERROR["status"] = status
+        LAST_API_ERROR["message"] = (message or "")[:800]
+
+def _get_last_api_error() -> Dict[str, Any]:
+    with API_ERROR_LOCK:
+        return dict(LAST_API_ERROR)
+
+def run_discover_cycle(client: 'EscavadorClient', trigger: str = "manual") -> Dict[str, Any]:
+    """Executa 1 ciclo de auto-discover e atualiza DISCOVER_STATE."""
+    if client is None:
+        raise RuntimeError("Client não inicializado.")
+    with DISCOVER_STATE_LOCK:
+        if DISCOVER_STATE.get("running"):
+            return {"ok": False, "error": "ALREADY_RUNNING", "state": dict(DISCOVER_STATE)}
+        DISCOVER_STATE["running"] = True
+        DISCOVER_STATE["last_trigger"] = trigger
+        DISCOVER_STATE["last_started"] = utcnow_iso()
+        DISCOVER_STATE["last_error"] = None
+        DISCOVER_STATE["last_totals"] = None
+        DISCOVER_STATE["last_finished"] = None
+
+    totals = {"docs": 0, "ran_docs": 0, "discovered": 0, "inserted_processos": 0, "linked": 0, "skipped": 0, "errors": 0}
+    try:
+        conn = db_connect()
+        try:
+            docs = _get_watchlist_docs(conn)[: max(DISCOVER_MAX_DOCS_PER_CYCLE, 1)]
+        finally:
+            conn.close()
+
+        for doc in docs:
+            if stop_flag.is_set():
+                break
+            totals["docs"] += 1
+            try:
+                conn = db_connect()
+                try:
+                    if DISCOVER_ONLY_IF_NO_LINKS and _doc_has_links(conn, doc):
+                        totals["skipped"] += 1
+                        continue
+                finally:
+                    conn.close()
+
+                st = _discover_link_for_doc(client, doc, limit=max(DISCOVER_LIMIT_PER_DOC, 1))
+                totals["ran_docs"] += 1
+                totals["discovered"] += st["discovered"]
+                totals["inserted_processos"] += st["inserted_processos"]
+                totals["linked"] += st["linked"]
+            except Exception:
+                totals["errors"] += 1
+                logger.exception("Discover cycle failed for doc=%s", doc)
+
+        logger.info(
+            "Discover cycle (%s): ran_docs=%s total_docs=%s skipped=%s discovered=%s inserted_processos=%s linked=%s errors=%s",
+            trigger,
+            totals["ran_docs"],
+            totals["docs"],
+            totals["skipped"],
+            totals["discovered"],
+            totals["inserted_processos"],
+            totals["linked"],
+            totals["errors"],
+        )
+        _set_discover_state(last_totals=totals, last_finished=utcnow_iso())
+        return {"ok": True, "totals": totals, "state": _get_discover_state()}
+    except Exception as e:
+        logger.exception("Discover cycle failed")
+        _set_discover_state(last_error=str(e), last_finished=utcnow_iso())
+        return {"ok": False, "error": "CYCLE_FAILED", "message": str(e), "state": _get_discover_state()}
+    finally:
+        _set_discover_state(running=False)
+
+logger.info(
+    "Discover configured: enabled=%s interval=%ss limit_per_doc=%s only_if_no_links=%s max_docs_per_cycle=%s",
+    AUTO_DISCOVER_ENABLED,
+    DISCOVER_INTERVAL_SECONDS,
+    DISCOVER_LIMIT_PER_DOC,
+    DISCOVER_ONLY_IF_NO_LINKS,
+    DISCOVER_MAX_DOCS_PER_CYCLE,
+)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def stable_hash(obj: Any) -> str:
+    s = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def require_token_configured():
+    if not ESCAVADOR_TOKEN:
+        abort(500, description="ESCAVADOR_TOKEN não configurado no ambiente/.env.")
+
+
+def normalize_doc(doc: str) -> str:
+    digits = re.sub(r"\D", "", doc or "")
+    if len(digits) in (11, 14):
+        return doc.strip()
+    raise ValueError("Documento inválido. Informe CPF (11 dígitos) ou CNPJ (14 dígitos).")
+
+
+def doc_type(doc: str) -> str:
+    digits = re.sub(r"\D", "", doc)
+    return "CNPJ" if len(digits) == 14 else "CPF"
+
+
+CNJ_REGEX = re.compile(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}")
+DOC_REGEX = re.compile(r"\b(\d{3}\.?\d{3}\.?\d{3}-?\d{2}|\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})\b")
+
+# ----------------------------
+# Escavador Client
+# ----------------------------
+class EscavadorClient:
+    def __init__(self, base: str, token: str):
+        self.base = base.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "X-Requested-With": "XMLHttpRequest",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "BlueService-EscavadorMonitor/4.3",
+            }
+        )
+
+    def _url(self, path: str) -> str:
+        return f"{self.base}{path}"
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        timeout: int = 45,
+        retries: int = 3,
+        backoff_seconds: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Requests JSON with small retry/backoff for transient network/API issues.
+
+        We retry on:
+          - network errors (RemoteDisconnected, timeouts, connection resets)
+          - HTTP 429 and 5xx (Escavador or edge hiccups)
+        """
+        url = self._url(path)
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, retries + 1):
+            try:
+                if method.upper() == "GET":
+                    r = self.session.get(url, params=params, timeout=timeout)
+                else:
+                    r = self.session.request(method.upper(), url, params=params, json=payload, timeout=timeout)
+
+                if r.status_code == 429 or 500 <= r.status_code <= 599:
+                    # Transient server-side or rate-limit.
+                    logger.warning("Escavador %s %s attempt=%s status=%s: %s", method, path, attempt, r.status_code, r.text[:400])
+                    if attempt < retries:
+                        time.sleep(backoff_seconds * attempt)
+                        continue
+
+                if r.status_code >= 400:
+                    logger.error("Escavador %s %s failed %s: %s", method, path, r.status_code, r.text[:1200])
+                    _set_last_api_error(method, path, r.status_code, r.text)
+                    r.raise_for_status()
+
+                # Some endpoints may reply with empty body (rare). Guard it.
+                if not (r.text or "").strip():
+                    return {}
+
+                return r.json()
+
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+                logger.warning("Escavador %s %s attempt=%s network_error=%s", method, path, attempt, repr(e)[:400])
+                _set_last_api_error(method, path, None, repr(e))
+                if attempt < retries:
+                    time.sleep(backoff_seconds * attempt)
+                    continue
+                raise
+
+        # Should never reach here.
+        if last_exc:
+            raise last_exc
+        return {}
+
+    def post(self, path: str, payload: Dict[str, Any], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self._request_json("POST", path, params=params, payload=payload)
+
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self._request_json("GET", path, params=params)
+
+    def criar_monitor_novos_processos(self, termo: str) -> Dict[str, Any]:
+        return self.post("/monitoramentos/novos-processos", {"termo": termo})
+
+    def criar_monitor_processo(self, numero_cnj: str) -> Dict[str, Any]:
+        return self.post("/monitoramentos/processos", {"numero": numero_cnj})
+
+    def listar_movimentacoes(self, numero_cnj: str, limit: int = 100) -> Dict[str, Any]:
+        service_key = "v2_movimentacoes_processo"
+        endpoint = f"/processos/numero_cnj/{numero_cnj}/movimentacoes"
+        status = None
+        data: Dict[str, Any] = {}
+        try:
+            data = self.get(endpoint, {"limit": limit})
+            status = 200
+            return data
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            raise
+        finally:
+            items = 0
+            try:
+                items = len(extract_list(data))
+            except Exception:
+                items = 0
+            cost = _estimate_cost_brl(service_key, items_upto=items)
+            record_api_usage(doc=None, cnj=numero_cnj, service_key=service_key, endpoint=endpoint, http_status=status, items_count=items, cost_brl=cost)
+
+    def obter_capa_processo(self, numero_cnj: str) -> Dict[str, Any]:
+        service_key = "v2_capa_processo"
+        endpoint = f"/processos/numero_cnj/{numero_cnj}"
+        status = None
+        data: Dict[str, Any] = {}
+        try:
+            data = self.get(endpoint, params=None)
+            status = 200
+            return data
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            raise
+        finally:
+            # capa não é lista; itens_count=0
+            cost = _estimate_cost_brl(service_key, items_upto=0)
+            record_api_usage(doc=None, cnj=numero_cnj, service_key=service_key, endpoint=endpoint, http_status=status, items_count=0, cost_brl=cost)
+
+    def listar_processos_envolvido(self, cpf_cnpj: str, limit: int = 50, page: Optional[int] = None) -> Dict[str, Any]:
+        service_key = "v2_processos_envolvido"
+        params: Dict[str, Any] = {"cpf_cnpj": cpf_cnpj, "limit": limit}
+        if page is not None:
+            params["page"] = page
+        endpoint = "/envolvido/processos"
+        status = None
+        data: Dict[str, Any] = {}
+        try:
+            data = self.get(endpoint, params=params)
+            status = 200
+            return data
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            raise
+        finally:
+            items = 0
+            try:
+                items = len(extract_list(data))
+            except Exception:
+                items = 0
+            # estimativa por lotes de 200 itens cumulativos
+            p = int(page or 1)
+            items_upto = (max(p-1, 0) * int(limit)) + items
+            cost = _estimate_cost_brl(service_key, items_upto=items_upto)
+            record_api_usage(doc=normalize_doc(cpf_cnpj), cnj=None, service_key=service_key, endpoint=endpoint, http_status=status, items_count=items, cost_brl=cost, notes=f"limit={limit} page={p}")
+
+    def listar_callbacks(self, limit: int = 100, page: Optional[int] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"limit": limit}
+        if page is not None:
+            params["page"] = page
+        return self.get("/callbacks", params=params)
+
+    def listar_documentos_publicos_v2(self, numero_cnj: str, limit: int = 50, page: int = 1) -> Dict[str, Any]:
+        """Lista documentos públicos de um processo pelo número CNJ (Escavador v2)."""
+        limit_n = 100 if int(limit) == 100 else 50
+        page_n = max(1, int(page))
+        endpoint = f"/processos/numero_cnj/{numero_cnj}/documentos-publicos"
+        return self.get(endpoint, {"limit": limit_n, "page": page_n})
+
+    def listar_autos_v2(self, numero_cnj: str, limit: int = 50, page: int = 1) -> Dict[str, Any]:
+        """Lista autos (documentos restritos) de um processo pelo número CNJ (Escavador v2)."""
+        limit_n = 100 if int(limit) == 100 else 50
+        page_n = max(1, int(page))
+        endpoint = f"/processos/numero_cnj/{numero_cnj}/autos"
+        return self.get(endpoint, {"limit": limit_n, "page": page_n})
+
+    def solicitar_atualizacao_v2(
+        self,
+        numero_cnj: str,
+        tipo_atualizacao: str = "PUBLICA",
+        send_callback: int = 0,
+        usuario: Optional[str] = None,
+        senha: Optional[str] = None,
+        certificado_id: Optional[int] = None,
+        documentos_especificos: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Solicita atualização de documentos de um processo no Escavador v2.
+
+        tipo_atualizacao: "PUBLICA" para documentos públicos, "RESTRITO" para autos.
+        """
+        endpoint = f"/processos/numero_cnj/{numero_cnj}/solicitar-atualizacao"
+        params: Dict[str, Any] = {}
+        if send_callback == 1:
+            params["send_callback"] = 1
+
+        payload: Dict[str, Any] = {
+            "tipo_atualizacao": tipo_atualizacao.upper(),
+        }
+        if tipo_atualizacao.upper() == "RESTRITO":
+            if usuario:
+                payload["usuario"] = str(usuario)
+            if senha:
+                payload["senha"] = str(senha)
+            if certificado_id is not None:
+                payload["certificado_id"] = int(certificado_id)
+            if documentos_especificos:
+                payload["documentos_especificos"] = str(documentos_especificos)
+
+        return self.post(endpoint, payload, params=params or None)
+
+    def status_atualizacao_v2(self, numero_cnj: str) -> Dict[str, Any]:
+        """Consulta o status de atualização de documentos/autos de um processo (Escavador v2)."""
+        endpoint = f"/processos/numero_cnj/{numero_cnj}/status-atualizacao"
+        return self.get(endpoint)
+
+    def baixar_documento_pdf_v2(self, numero_cnj: str, key: str) -> requests.Response:
+        """Baixa um documento (PDF) de um processo pelo key retornado pelo Escavador v2."""
+        endpoint = f"/processos/numero_cnj/{numero_cnj}/documentos/{key}"
+        return self._request_raw("GET", endpoint)
+
+    def _request_raw(self, method: str, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+        """Faz uma requisição raw (sem JSON parsing) — usado para download de PDFs."""
+        url = self._url(path)
+        r = self.session.request(method, url, params=params, timeout=45)
+        r.raise_for_status()
+        return r
+
+# ----------------------------
+# SQLite
+# ----------------------------
+
+
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+
+def db_conn() -> sqlite3.Connection:
+    # Backwards-compatible alias (some routes used db_conn)
+    return db_connect()
+
+def db_init() -> None:
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS watchlist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc TEXT NOT NULL UNIQUE,
+        tipo_doc TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )"""
+    )
+
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS processos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cnj TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        last_sync_at TEXT,
+        last_event_at TEXT
+    )"""
+    )
+
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS eventos_mov (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cnj TEXT NOT NULL,
+        event_hash TEXT NOT NULL,
+        data TEXT,
+        tipo TEXT,
+        tipo_inferido TEXT,
+        texto TEXT,
+        raw_json TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(cnj, event_hash)
+    )"""
+    )
+
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS callback_inbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        payload_hash TEXT NOT NULL UNIQUE,
+        payload_json TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        processed_at TEXT,
+        status TEXT NOT NULL DEFAULT 'PENDING',
+        error TEXT
+    )"""
+    )
+
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS doc_process (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc TEXT NOT NULL,
+        cnj TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(doc, cnj)
+    )"""
+    )
+
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS alert_state (
+        doc TEXT PRIMARY KEY,
+        last_event_id INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )"""
+    )
+
+    
+    # Cache de capa (JSON bruto) por CNJ
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS capa_cache (
+        cnj TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )"""
+    )
+    
+    # Uso da API (para métricas de custo)
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS api_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        doc TEXT,
+        cnj TEXT,
+        service_key TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        http_status INTEGER,
+        items_count INTEGER NOT NULL DEFAULT 0,
+        cost_brl REAL NOT NULL DEFAULT 0.0,
+        notes TEXT
+    )"""
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_ts ON api_usage (ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_doc_ts ON api_usage (doc, ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_cnj_ts ON api_usage (cnj, ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_service_ts ON api_usage (service_key, ts)")
+    # Extrato real (importado) da API (custos cobrados pelo Escavador)
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS api_usage_real (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        doc TEXT,
+        cnj TEXT,
+        method TEXT,
+        endpoint TEXT NOT NULL,
+        cost_brl REAL NOT NULL,
+        raw_line TEXT
+    )"""
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_real_ts ON api_usage_real (ts)")
+    # Dedup (fingerprint)
+    try:
+        cur.execute("PRAGMA table_info(api_usage_real)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "fingerprint" not in cols:
+            cur.execute("ALTER TABLE api_usage_real ADD COLUMN fingerprint TEXT")
+    except Exception:
+        pass
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_usage_real_fp ON api_usage_real (fingerprint)")
+    # Import batch metadata
+    try:
+        cur.execute("PRAGMA table_info(api_usage_real)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "imported_at" not in cols:
+            cur.execute("ALTER TABLE api_usage_real ADD COLUMN imported_at TEXT")
+        if "source" not in cols:
+            cur.execute("ALTER TABLE api_usage_real ADD COLUMN source TEXT")
+    except Exception:
+        pass
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_real_imported_at ON api_usage_real (imported_at)")
+    
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_real_doc_ts ON api_usage_real (doc, ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_real_cnj_ts ON api_usage_real (cnj, ts)")
+
+
+    # Tabela opcional de preços (override dos defaults em código)
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS pricing (
+        service_key TEXT PRIMARY KEY,
+        model TEXT NOT NULL,              -- FIXED / ITEMS200
+        base_cost_brl REAL NOT NULL,
+        step_cost_brl REAL NOT NULL DEFAULT 0.0,
+        step_items INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )"""
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_eventos_cnj_id ON eventos_mov (cnj, id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_doc_process_doc ON doc_process (doc)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_doc_process_cnj ON doc_process (cnj)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_inbox_status ON callback_inbox (status, id)")
+
+
+    # --- cache de documentos (Escavador v2) ---
+    cur.execute("""CREATE TABLE IF NOT EXISTS docs_v2_cache(
+        cnj TEXT NOT NULL,
+        tipo TEXT NOT NULL,
+        limit_n INTEGER NOT NULL,
+        page_n INTEGER NOT NULL,
+        items_json TEXT NOT NULL,
+        links_json TEXT,
+        paginator_json TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(cnj,tipo,limit_n,page_n)
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS updates_v2(
+        cnj TEXT NOT NULL,
+        tipo TEXT NOT NULL,
+        request_json TEXT,
+        response_json TEXT,
+        status_json TEXT,
+        status TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(cnj,tipo)
+    )""")
+    conn.commit()
+    conn.close()
+
+
+
+# ----------------------------
+# Custos (precificação + uso)
+# ----------------------------
+PRICING_DEFAULTS = {
+    # Escavador API V2 (baseado na tabela enviada)
+    "v2_capa_processo": {"model": "FIXED", "base": 0.04},
+    "v2_movimentacoes_processo": {"model": "FIXED", "base": 0.04},
+    # Processos do envolvido: R$ 2,90 até 200 itens + R$ 0,05 a cada 200
+    "v2_processos_envolvido": {"model": "ITEMS200", "base": 2.90, "step": 0.05, "step_items": 200},
+    # Outros (se você quiser ativar depois)
+    "v2_resumo_envolvido": {"model": "FIXED", "base": 0.35},
+    "v2_resumo_processo_ia": {"model": "FIXED", "base": 0.04},
+}
+
+def _pricing_for(service_key: str) -> dict:
+    """Retorna precificação. Primeiro tenta tabela pricing, senão defaults."""
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT model, base_cost_brl, step_cost_brl, step_items FROM pricing WHERE service_key=?", (service_key,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return {
+                "model": (row["model"] if isinstance(row, sqlite3.Row) else row[0]),
+                "base": float(row["base_cost_brl"] if isinstance(row, sqlite3.Row) else row[1]),
+                "step": float(row["step_cost_brl"] if isinstance(row, sqlite3.Row) else row[2]),
+                "step_items": int(row["step_items"] if isinstance(row, sqlite3.Row) else row[3]),
+            }
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return PRICING_DEFAULTS.get(service_key, {"model": "FIXED", "base": 0.0})
+
+def _estimate_cost_brl(service_key: str, *, items_upto: int = 0) -> float:
+    p = _pricing_for(service_key)
+    model = (p.get("model") or "FIXED").upper()
+    base = float(p.get("base") or 0.0)
+    if model == "ITEMS200":
+        step = float(p.get("step") or 0.0)
+        step_items = int(p.get("step_items") or 200) or 200
+        if items_upto <= 0:
+            return base
+        batches = (items_upto + step_items - 1) // step_items
+        return base + step * max(0, batches - 1)
+    return base
+
+def record_api_usage(*, doc: Optional[str], cnj: Optional[str], service_key: str, endpoint: str, http_status: Optional[int], items_count: int, cost_brl: float, notes: str = "") -> None:
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO api_usage (ts, doc, cnj, service_key, endpoint, http_status, items_count, cost_brl, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (utcnow_iso(), doc, cnj, service_key, endpoint, http_status, int(items_count or 0), float(cost_brl or 0.0), notes[:500]),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("Falha ao registrar api_usage")
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+# ----------------------------
+# Custos reais (importados do extrato do Escavador)
+# ----------------------------
+EXTRATO_LINE_RE = re.compile(r"^(GET|POST|PUT|DELETE)\s+(\S+)\s+R\$\s*([+-]?[\d\.,]+)\s+(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})\s*$")
+
+def _parse_brl_value(s: str) -> float:
+    s = s.strip().replace("R$", "").strip()
+    # "0,04" ou "-0,04" (o extrato vem negativo)
+    s = s.replace(".", "").replace(",", ".")
+    return float(s)
+
+def _extract_cnj_from_endpoint(ep: str) -> Optional[str]:
+    m = re.search(r"/processos/numero_cnj/([^/?]+)", ep)
+    return m.group(1) if m else None
+
+def _extract_doc_from_endpoint(ep: str) -> Optional[str]:
+    """Extrai CPF/CNPJ (doc) de um endpoint/querystring, de forma tolerante.
+    Aceita valor URL-encoded e com pontuação. Retorna apenas se tiver 11 (CPF) ou 14 (CNPJ) dígitos.
+    """
+    m = re.search(r"(?:\?|&)cpf_cnpj=([^&]+)", ep)
+    if not m:
+        return None
+    raw = m.group(1)
+    try:
+        raw = unquote_plus(str(raw))
+    except Exception:
+        raw = str(raw)
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) in (11, 14):
+        return digits
+    return None
+
+def _fingerprint_usage(ts_iso: str, method: str, endpoint: str, cost_brl: float) -> str:
+    s = f"{ts_iso}|{method}|{endpoint}|{float(cost_brl):.6f}"
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+def record_api_usage_real(*, ts_iso: str, doc: Optional[str], cnj: Optional[str], method: str, endpoint: str,
+                         cost_brl: float, raw_line: str, source: str = "xlsx", imported_at: Optional[str] = None) -> None:
+    """Registra consumo REAL importado do extrato (com dedupe via fingerprint)."""
+    try:
+        fp = _fingerprint_usage(ts_iso, method, endpoint, float(cost_brl))
+        imported_at = imported_at or utcnow_iso()
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO api_usage_real (ts, doc, cnj, method, endpoint, cost_brl, raw_line, fingerprint, imported_at, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts_iso, doc, cnj, method, endpoint, float(cost_brl), (raw_line or "")[:800], fp, imported_at, source),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("Falha ao registrar api_usage_real")
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+db_init()
+
+# ----------------------------
+# Tipo inferido (fallback)
+# ----------------------------
+KEYWORDS = [
+    ("CITACAO", [r"\bcita", r"\bcitação", r"\bcitacao"]),
+    ("INTIMACAO", [r"\bintim", r"\bintimação", r"\bintimacao"]),
+    ("SENTENCA", [r"\bsenten", r"\bsentença", r"\bsentenca"]),
+    ("DECISAO", [r"\bdecis", r"\bdecisão", r"\bdecisao"]),
+    ("DESPACHO", [r"\bdespach"]),
+    ("AUDIENCIA", [r"\baudi", r"\baudiência", r"\baudiencia"]),
+    ("JUNTADA", [r"\bjuntad"]),
+    ("DISTRIBUICAO", [r"\bdistribu", r"\bdistribuição", r"\bdistribuicao"]),
+    ("PENHORA", [r"\bpenhor"]),
+    ("TRANSITO", [r"\btr[âa]nsit", r"\btransit"]),
+]
+
+
+def infer_tipo(texto: str) -> Optional[str]:
+    if not texto:
+        return None
+    for label, patterns in KEYWORDS:
+        for p in patterns:
+            if re.search(p, texto, flags=re.IGNORECASE):
+                return label
+    return None
+
+
+def mov_to_hash(mov: Dict[str, Any]) -> str:
+    for key in ("id", "codigo", "uuid", "hash"):
+        if mov.get(key):
+            return f"id:{mov[key]}"
+    core = {
+        "data": mov.get("data") or mov.get("data_hora") or mov.get("dataHora") or mov.get("dataHoraCadastro"),
+        "texto": mov.get("texto") or mov.get("descricao") or mov.get("conteudo"),
+        "tipo": mov.get("tipo") or mov.get("tipo_movimentacao") or mov.get("tipoMovimentacao"),
+    }
+    return stable_hash(core)
+
+
+def extract_list(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, dict):
+        for k in ("items", "data", "movimentacoes", "results", "callbacks", "processos"):
+            if isinstance(data.get(k), list):
+                return data[k]
+    if isinstance(data, list):
+        return data
+    return []
+
+
+# ----------------------------
+# Callback parsing
+# ----------------------------
+def parse_cnj_candidates(payload: Dict[str, Any]) -> List[str]:
+    cnjs: List[str] = []
+
+    def scan(o: Any):
+        if isinstance(o, dict):
+            for _, v in o.items():
+                if isinstance(v, (dict, list)):
+                    scan(v)
+                elif isinstance(v, str):
+                    m = CNJ_REGEX.search(v)
+                    if m:
+                        cnjs.append(m.group(0))
+        elif isinstance(o, list):
+            for x in o:
+                scan(x)
+
+    scan(payload)
+    out, seen = [], set()
+    for c in cnjs:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def parse_doc_candidates(payload: Dict[str, Any]) -> List[str]:
+    docs: List[str] = []
+
+    def add_doc(s: str):
+        m = DOC_REGEX.search(s or "")
+        if not m:
+            return
+        raw = m.group(1)
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) in (11, 14):
+            docs.append(raw)
+
+    def scan(o: Any):
+        if isinstance(o, dict):
+            for _, v in o.items():
+                if isinstance(v, (dict, list)):
+                    scan(v)
+                elif isinstance(v, str):
+                    add_doc(v)
+        elif isinstance(o, list):
+            for x in o:
+                scan(x)
+
+    scan(payload)
+    out, seen = [], set()
+    for d in docs:
+        key = re.sub(r"\D", "", d)
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
+# ----------------------------
+# Core: sync + persistence
+# ----------------------------
+@dataclass
+class ProcessResult:
+    cnj: str
+    new_events: int
+
+
+def ensure_process_registered(conn: sqlite3.Connection, cnj: str) -> None:
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO processos (cnj, created_at) VALUES (?, ?)", (cnj, utcnow_iso()))
+    conn.commit()
+
+
+def link_doc_process(conn: sqlite3.Connection, doc: str, cnj: str) -> bool:
+    """Link doc->cnj. Returns True if a new link was created."""
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO doc_process (doc, cnj, created_at) VALUES (?, ?, ?)",
+        (doc, cnj, utcnow_iso()),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def unlink_doc_process(conn: sqlite3.Connection, doc: str, cnj: str) -> int:
+    cur = conn.cursor()
+    cur.execute("DELETE FROM doc_process WHERE doc=? AND cnj=?", (doc, cnj))
+    conn.commit()
+    return cur.rowcount
+
+def upsert_processo(conn: sqlite3.Connection, cnj: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO processos (cnj, created_at) VALUES (?, ?)",
+        (cnj, utcnow_iso()),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+
+def save_mov_events(conn: sqlite3.Connection, cnj: str, movs: List[Dict[str, Any]]) -> int:
+    cur = conn.cursor()
+    new_count = 0
+    for mov in movs:
+        event_hash = mov_to_hash(mov)
+        texto = mov.get("texto") or mov.get("descricao") or mov.get("conteudo") or ""
+        tipo = mov.get("tipo") or mov.get("tipo_movimentacao") or mov.get("tipoMovimentacao")
+        tipo_inf = infer_tipo(texto)
+        data = mov.get("data") or mov.get("data_hora") or mov.get("dataHora") or mov.get("dataHoraCadastro")
+        raw = json.dumps(mov, ensure_ascii=False)
+
+        try:
+            cur.execute(
+                """INSERT INTO eventos_mov
+                   (cnj, event_hash, data, tipo, tipo_inferido, texto, raw_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (cnj, event_hash, data, tipo, tipo_inf, texto, raw, utcnow_iso()),
+            )
+            new_count += 1
+        except sqlite3.IntegrityError:
+            continue
+
+    if new_count > 0:
+        cur.execute("UPDATE processos SET last_event_at=?, last_sync_at=? WHERE cnj=?", (utcnow_iso(), utcnow_iso(), cnj))
+    else:
+        cur.execute("UPDATE processos SET last_sync_at=? WHERE cnj=?", (utcnow_iso(), cnj))
+    conn.commit()
+    return new_count
+
+
+def sync_process_movements(client: EscavadorClient, cnj: str, limit: int = 300) -> ProcessResult:
+    data = client.listar_movimentacoes(cnj, limit=limit)
+    movs = extract_list(data)
+
+    conn = db_connect()
+    ensure_process_registered(conn, cnj)
+    new_events = save_mov_events(conn, cnj, movs)
+    conn.close()
+    return ProcessResult(cnj=cnj, new_events=new_events)
+
+
+def ingest_callback(source: str, payload: Dict[str, Any]) -> Tuple[bool, str]:
+    h = stable_hash(payload)
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO callback_inbox (source, payload_hash, payload_json, received_at) VALUES (?, ?, ?, ?)",
+            (source, h, json.dumps(payload, ensure_ascii=False), utcnow_iso()),
+        )
+        conn.commit()
+        return True, h
+    except sqlite3.IntegrityError:
+        return False, h
+    finally:
+        conn.close()
+
+
+def process_inbox_once(client: EscavadorClient, max_items: int = 25) -> Dict[str, Any]:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, payload_json FROM callback_inbox WHERE status='PENDING' ORDER BY id ASC LIMIT ?",
+        (max_items,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    processed, errors = 0, 0
+    cnj_synced: Dict[str, int] = {}
+    linked: List[Dict[str, str]] = []
+
+    for row in rows:
+        inbox_id = row["id"]
+        payload = json.loads(row["payload_json"])
+        try:
+            cnjs = parse_cnj_candidates(payload)
+            docs = parse_doc_candidates(payload)
+
+            for cnj in cnjs:
+                try:
+                    client.criar_monitor_processo(cnj)
+                except requests.HTTPError as e:
+                    logger.warning("criar_monitor_processo(%s) warning: %s", cnj, str(e))
+
+                res = sync_process_movements(client, cnj, limit=400)
+                cnj_synced[cnj] = cnj_synced.get(cnj, 0) + res.new_events
+
+                if docs:
+                    conn3 = db_connect()
+                    for d in docs:
+                        try:
+                            dnorm = normalize_doc(d)
+                        except Exception:
+                            continue
+                        link_doc_process(conn3, dnorm, cnj)
+                        linked.append({"doc": dnorm, "cnj": cnj})
+                    conn3.close()
+
+            conn2 = db_connect()
+            cur2 = conn2.cursor()
+            cur2.execute("UPDATE callback_inbox SET status='PROCESSED', processed_at=? WHERE id=?", (utcnow_iso(), inbox_id))
+            conn2.commit()
+            conn2.close()
+            processed += 1
+
+        except Exception as ex:
+            logger.exception("Failed processing inbox id=%s", inbox_id)
+            conn2 = db_connect()
+            cur2 = conn2.cursor()
+            cur2.execute(
+                "UPDATE callback_inbox SET status='ERROR', processed_at=?, error=? WHERE id=?",
+                (utcnow_iso(), str(ex)[:1000], inbox_id),
+            )
+            conn2.commit()
+            conn2.close()
+            errors += 1
+
+    return {"processed": processed, "errors": errors, "cnj_new_events": cnj_synced, "linked": linked}
+
+
+# ----------------------------
+# Polling thread
+# ----------------------------
+stop_flag = threading.Event()
+
+
+def poll_callbacks_loop(client: EscavadorClient):
+    logger.info("Polling loop started (interval=%ss)", POLL_INTERVAL_SECONDS)
+    while not stop_flag.is_set():
+        _set_poll_state(running=True, last_started=utcnow_iso(), last_error=None)
+        try:
+            data = client.listar_callbacks(limit=100, page=1)
+            callbacks = extract_list(data)
+
+            inserted = 0
+            for cb in callbacks:
+                ins, _ = ingest_callback("poll", cb)
+                if ins:
+                    inserted += 1
+
+            pr = process_inbox_once(client, max_items=50)
+            logger.info(
+                "Poll: inserted=%s processed=%s errors=%s cnj_events=%s linked=%s",
+                inserted,
+                pr["processed"],
+                pr["errors"],
+                pr["cnj_new_events"],
+                len(pr.get("linked", [])),
+            )
+            _set_poll_state(last_totals={"inserted": inserted, "processed": pr["processed"], "errors": pr["errors"], "linked": len(pr.get("linked", []))}, last_finished=utcnow_iso())
+        except Exception as e:
+            logger.exception("Polling failed")
+            _set_poll_state(last_error=str(e), last_finished=utcnow_iso())
+        finally:
+            _set_poll_state(running=False)
+
+        stop_flag.wait(POLL_INTERVAL_SECONDS)
+
+
+
+# ----------------------------
+# Auto-discover: watchlist -> processes linking
+# ----------------------------
+def _get_watchlist_docs(conn) -> list[str]:
+    cur = conn.cursor()
+    cur.execute("SELECT doc FROM watchlist ORDER BY id ASC")
+    rows = cur.fetchall()
+    docs: list[str] = []
+    for r in rows:
+        # sqlite3.Row supports mapping-style access, but has no .get()
+        v = r["doc"]
+        if v:
+            docs.append(v)
+    return docs
+
+
+def _doc_has_links(conn, doc: str) -> bool:
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM doc_process WHERE doc=? LIMIT 1", (doc,))
+    return cur.fetchone() is not None
+
+
+def _discover_link_for_doc(client: EscavadorClient, doc: str, limit: int) -> dict:
+    """Discover CNJs for a doc (CPF/CNPJ) and link them. Returns stats."""
+    docn = normalize_doc(doc)
+    resp = client.listar_processos_envolvido(docn, limit=limit, page=1)  # type: ignore
+    processos = extract_list(resp)
+    if not processos and isinstance(resp, dict) and isinstance(resp.get("processos"), list):
+        processos = resp["processos"]
+
+    discovered = []
+    inserted_processos = 0
+    linked = 0
+
+    conn = db_connect()
+    try:
+        for p in processos:
+            if not isinstance(p, dict):
+                continue
+            cnj = (p.get("numero_cnj") or p.get("numero") or p.get("cnj") or "").strip()
+            if not cnj or not CNJ_REGEX.fullmatch(cnj):
+                continue
+            discovered.append(cnj)
+            if upsert_processo(conn, cnj):
+                inserted_processos += 1
+            if link_doc_process(conn, docn, cnj):
+                linked += 1
+    finally:
+        conn.close()
+
+    return {
+        "doc": docn,
+        "discovered": len(discovered),
+        "inserted_processos": inserted_processos,
+        "linked": linked,
+    }
+
+
+def auto_discover_loop(client: EscavadorClient):
+    if DISCOVER_INTERVAL_SECONDS <= 0:
+        logger.info("Auto-discover desabilitado (DISCOVER_INTERVAL_SECONDS<=0).")
+        return
+    logger.info(
+        "Auto-discover loop started (enabled=%s interval=%ss)",
+        AUTO_DISCOVER_ENABLED,
+        DISCOVER_INTERVAL_SECONDS,
+    )
+
+    while not stop_flag.is_set():
+        if not AUTO_DISCOVER_ENABLED:
+            stop_flag.wait(min(DISCOVER_INTERVAL_SECONDS, 10))
+            continue
+
+        if not ESCAVADOR_TOKEN:
+            logger.info("Auto-discover pausado: ESCAVADOR_TOKEN ausente.")
+            stop_flag.wait(DISCOVER_INTERVAL_SECONDS)
+            continue
+
+        try:
+            run_discover_cycle(client, trigger="auto")  # type: ignore
+        except Exception:
+            logger.exception("Auto-discover cycle failed")
+
+        stop_flag.wait(DISCOVER_INTERVAL_SECONDS)
+
+# ----------------------------
+# Flask app
+# ----------------------------
+
+def esc(v: object) -> str:
+    """HTML-escape helper for UI rendering."""
+    return html.escape("" if v is None else str(v), quote=True)
+
+
+app = Flask(__name__)
+client = EscavadorClient(ESCAVADOR_BASE, ESCAVADOR_TOKEN) if ESCAVADOR_TOKEN else None
+
+
+@app.get("/")
+def home():
+    return redirect("/ui")
+
+
+@app.get("/favicon.ico")
+def favicon():
+    # Silence browser favicon 404s
+    return ("", 204)
+
+@app.get("/.well-known/appspecific/com.chrome.devtools.json")
+def chrome_devtools_well_known():
+    # Silence Chrome DevTools well-known probe
+    return ("", 204)
+# ============================================================
+# API JSON: health
+# ============================================================
+@app.get("/health")
+def health():
+    return jsonify(
+        {
+            "ok": True,
+            "time": utcnow_iso(),
+            "escavador_base": ESCAVADOR_BASE,
+            "token_configured": bool(ESCAVADOR_TOKEN),
+            "webhook_auth_configured": bool(WEBHOOK_AUTH_TOKEN),
+            "db_path": DB_PATH,
+            "db_path_abs": DB_PATH_ABS,
+            "cwd": os.getcwd(),
+            "poll_interval_seconds": POLL_INTERVAL_SECONDS,
+            "auto_discover_enabled": bool(AUTO_DISCOVER_ENABLED),
+            "discover_interval_seconds": DISCOVER_INTERVAL_SECONDS,
+            "discover_limit_per_doc": DISCOVER_LIMIT_PER_DOC,
+            "discover_only_if_no_links": bool(DISCOVER_ONLY_IF_NO_LINKS),
+            "discover_max_docs_per_cycle": DISCOVER_MAX_DOCS_PER_CYCLE,
+            "discover_state": _get_discover_state(),
+        }
+    )
+
+
+# ============================================================
+# API JSON: Watchlist CRUD
+# ============================================================
+@app.get("/watchlist")
+def list_watchlist():
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT id, doc, tipo_doc, created_at FROM watchlist ORDER BY id DESC LIMIT 500")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify({"ok": True, "count": len(rows), "items": rows})
+
+
+@app.post("/watchlist")
+def create_watchlist():
+    require_token_configured()
+    payload = request.get_json(force=True, silent=False) or {}
+    doc_in = (payload.get("doc") or "").strip()
+    if not doc_in:
+        abort(400, description="Campo 'doc' é obrigatório.")
+    try:
+        doc = normalize_doc(doc_in)
+    except ValueError as e:
+        abort(400, description=str(e))
+    tipo = doc_type(doc)
+
+    api_resp: Dict[str, Any]
+    try:
+        api_resp = client.criar_monitor_novos_processos(doc)  # type: ignore
+    except requests.HTTPError as e:
+        api_resp = {"warning": "monitoramento pode já existir", "detail": str(e)}
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO watchlist (doc, tipo_doc, created_at) VALUES (?, ?, ?)", (doc, tipo, utcnow_iso()))
+    conn.commit()
+    cur.execute("SELECT id FROM watchlist WHERE doc=?", (doc,))
+    row = cur.fetchone()
+    conn.close()
+
+    return jsonify({"ok": True, "id": row["id"] if row else None, "doc": doc, "tipo_doc": tipo, "escavador": api_resp})
+
+
+@app.delete("/watchlist/<int:watch_id>")
+def delete_watchlist_by_id(watch_id: int):
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM watchlist WHERE id=?", (watch_id,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return jsonify({"ok": True, "deleted": deleted})
+
+
+# ============================================================
+# API JSON: doc_process CRUD
+# ============================================================
+@app.get("/processos/<path:cnj>/docs")
+def list_docs_for_process(cnj: str):
+    if not CNJ_REGEX.fullmatch(cnj):
+        abort(400, description="CNJ inválido.")
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT doc, created_at FROM doc_process WHERE cnj=? ORDER BY created_at DESC", (cnj,))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify({"ok": True, "cnj": cnj, "count": len(rows), "items": rows})
+
+
+@app.post("/docs/link")
+def create_doc_link():
+    payload = request.get_json(force=True, silent=False) or {}
+    doc = (payload.get("doc") or "").strip()
+    cnj = (payload.get("cnj") or "").strip()
+    if not doc or not cnj:
+        abort(400, description="Campos 'doc' e 'cnj' são obrigatórios.")
+    try:
+        docn = normalize_doc(doc)
+    except Exception:
+        abort(400, description="Doc inválido.")
+    if not CNJ_REGEX.fullmatch(cnj):
+        abort(400, description="CNJ inválido.")
+
+    conn = db_connect()
+    ensure_process_registered(conn, cnj)
+    link_doc_process(conn, docn, cnj)
+    conn.close()
+    return jsonify({"ok": True, "doc": docn, "cnj": cnj})
+
+
+@app.get("/docs/<path:doc>/processos")
+def list_processes_for_doc(doc: str):
+    try:
+        docn = normalize_doc(doc)
+    except Exception:
+        abort(400, description="Doc inválido.")
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT cnj, created_at FROM doc_process WHERE doc=? ORDER BY created_at DESC LIMIT 500",
+        (docn,),
+    )
+    items = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify({"ok": True, "doc": docn, "count": len(items), "items": items})
+
+
+@app.post("/docs/<path:doc>/discover")
+def discover_and_link_processes(doc: str):
+    require_token_configured()
+    try:
+        docn = normalize_doc(doc)
+    except Exception:
+        abort(400, description="Doc inválido.")
+    limit = int((request.args.get("limit") or "50").strip())
+    if limit <= 0:
+        limit = 50
+
+    discovered: List[str] = []
+    linked: List[Dict[str, str]] = []
+    inserted_processos = 0
+
+    # Endpoint: /api/v2/envolvido/processos?cpf_cnpj=...
+    try:
+        resp = client.listar_processos_envolvido(docn, limit=limit, page=1)  # type: ignore
+    except requests.exceptions.RequestException as e:
+        logger.error("Discover failed (network/API) doc=%s: %s", docn, repr(e)[:400])
+        return jsonify({"ok": False, "doc": docn, "error": "Falha ao consultar Escavador (conexão/API). Tente novamente."}), 502
+    processos = extract_list(resp)
+    # fallback: algumas respostas vêm como {"processos":[...]}
+    if not processos and isinstance(resp, dict) and isinstance(resp.get("processos"), list):
+        processos = resp["processos"]
+
+    conn = db_connect()
+    for p in processos:
+        if not isinstance(p, dict):
+            continue
+        cnj = (p.get("numero_cnj") or p.get("numero") or p.get("cnj") or "").strip()
+        if not cnj or not CNJ_REGEX.fullmatch(cnj):
+            continue
+        discovered.append(cnj)
+        if upsert_processo(conn, cnj):
+            inserted_processos += 1
+        link_doc_process(conn, docn, cnj)
+        linked.append({"doc": docn, "cnj": cnj})
+    conn.close()
+
+    return jsonify(
+        {
+            "ok": True,
+            "doc": docn,
+            "discovered": len(discovered),
+            "inserted_processos": inserted_processos,
+            "linked": linked[:500],
+        }
+    )
+
+
+@app.get("/docs/<path:doc>/alerts")
+def get_alerts_for_doc(doc: str):
+    try:
+        docn = normalize_doc(doc)
+    except Exception:
+        abort(400, description="Doc inválido.")
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("SELECT last_event_id FROM alert_state WHERE doc=?", (docn,))
+    row = cur.fetchone()
+    last_id = int(row["last_event_id"]) if row else 0
+
+    cur.execute("SELECT cnj FROM doc_process WHERE doc=?", (docn,))
+    cnjs = [r["cnj"] for r in cur.fetchall()]
+
+    max_id = 0
+    new_count = 0
+    if cnjs:
+        placeholders = ",".join(["?"] * len(cnjs))
+        cur.execute(f"SELECT COALESCE(MAX(id),0) AS mid FROM eventos_mov WHERE cnj IN ({placeholders})", cnjs)
+        max_id = int(cur.fetchone()["mid"] or 0)
+
+        cur.execute(f"SELECT COUNT(*) AS c FROM eventos_mov WHERE id>? AND cnj IN ({placeholders})", [last_id, *cnjs])
+        new_count = int(cur.fetchone()["c"] or 0)
+
+    conn.close()
+    return jsonify({"ok": True, "doc": docn, "new_events": new_count, "last_event_id": last_id, "max_event_id": max_id})
+
+
+@app.post("/docs/<path:doc>/alerts/ack")
+def ack_alerts_for_doc(doc: str):
+    try:
+        docn = normalize_doc(doc)
+    except Exception:
+        abort(400, description="Doc inválido.")
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT cnj FROM doc_process WHERE doc=?", (docn,))
+    cnjs = [r["cnj"] for r in cur.fetchall()]
+
+    max_id = 0
+    if cnjs:
+        placeholders = ",".join(["?"] * len(cnjs))
+        cur.execute(f"SELECT COALESCE(MAX(id),0) AS mid FROM eventos_mov WHERE cnj IN ({placeholders})", cnjs)
+        max_id = int(cur.fetchone()["mid"] or 0)
+
+    cur.execute(
+        "INSERT INTO alert_state (doc, last_event_id, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(doc) DO UPDATE SET last_event_id=excluded.last_event_id, updated_at=excluded.updated_at",
+        (docn, max_id, utcnow_iso()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "doc": docn, "acked_to_event_id": max_id})
+
+@app.delete("/docs/link")
+def delete_doc_link():
+    payload = request.get_json(force=True, silent=False) or {}
+    doc = (payload.get("doc") or "").strip()
+    cnj = (payload.get("cnj") or "").strip()
+    if not doc or not cnj:
+        abort(400, description="Campos 'doc' e 'cnj' são obrigatórios.")
+    try:
+        docn = normalize_doc(doc)
+    except Exception:
+        abort(400, description="Doc inválido.")
+    if not CNJ_REGEX.fullmatch(cnj):
+        abort(400, description="CNJ inválido.")
+
+    conn = db_connect()
+    deleted = unlink_doc_process(conn, docn, cnj)
+    conn.close()
+    return jsonify({"ok": True, "doc": docn, "cnj": cnj, "deleted": deleted})
+
+
+# ============================================================
+# API JSON: Processos + Eventos
+# ============================================================
+@app.post("/processos/<path:cnj>/sync")
+def sync_process(cnj: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        abort(400, description="CNJ inválido.")
+    try:
+        res = sync_process_movements(client, cnj, limit=400)  # type: ignore
+        return jsonify({"ok": True, "cnj": cnj, "new_events": res.new_events})
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", 500)
+        esc_msg = None
+        try:
+            j = e.response.json() if e.response is not None else {}
+            esc_msg = j.get("error") or j.get("message")
+        except Exception:
+            esc_msg = str(e)
+
+        if status == 402:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "SEM_CREDITO_API",
+                        "message": esc_msg or "Você não possui saldo em crédito da API do Escavador.",
+                        "cnj": cnj,
+                    }
+                ),
+                402,
+            )
+
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "ESCAVADOR_HTTP_ERROR",
+                    "status": status,
+                    "message": esc_msg or "Erro ao consultar o Escavador.",
+                    "cnj": cnj,
+                }
+            ),
+            status,
+        )
+
+    except requests.RequestException as e:
+        # Conexão/timeout/etc (não é HTTPError com response)
+        logger.error("Sync failed (network): %s", str(e))
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "error": "ESCAVADOR_CONEXAO",
+                    "status": 502,
+                    "message": str(e) or "Falha de conexão ao consultar o Escavador.",
+                    "cnj": cnj,
+                }
+            ),
+            502,
+        )
+
+
+
+
+@app.get("/processos/<path:cnj>/documentos-publicos")
+def api_documentos_publicos_v2(cnj: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ inválido"}), 422
+
+    limit_n = 100 if int(request.args.get("limit") or 50) == 100 else 50
+    page_n = max(1, int(request.args.get("page") or 1))
+
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT items_json, links_json, paginator_json, updated_at FROM docs_v2_cache WHERE cnj=? AND tipo=? AND limit_n=? AND page_n=?",
+        (cnj, "publicos", limit_n, page_n),
+    )
+    row = cur.fetchone()
+    if row:
+        items_json, links_json, paginator_json, updated_at = row
+        return jsonify({
+            "ok": True, "cnj": cnj, "tipo": "publicos", "cached": True,
+            "items": json.loads(items_json),
+            "links": json.loads(links_json) if links_json else None,
+            "paginator": json.loads(paginator_json) if paginator_json else None,
+            "updated_at": updated_at,
+        })
+
+    try:
+        data = client.listar_documentos_publicos_v2(cnj, limit=limit_n, page=page_n)
+    except Exception as e:
+        return jsonify({"ok": False, "cnj": cnj, "error": str(e)}), 502
+
+    items = data.get("items") if isinstance(data, dict) else []
+    if not isinstance(items, list):
+        items = []
+    links = data.get("links") if isinstance(data, dict) else None
+    paginator = data.get("paginator") if isinstance(data, dict) else None
+
+    now = utcnow_iso()
+    cur.execute(
+        "INSERT OR REPLACE INTO docs_v2_cache(cnj,tipo,limit_n,page_n,items_json,links_json,paginator_json,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+        (
+            cnj, "publicos", limit_n, page_n,
+            json.dumps(items, ensure_ascii=False),
+            json.dumps(links, ensure_ascii=False) if links else None,
+            json.dumps(paginator, ensure_ascii=False) if paginator else None,
+            now,
+        ),
+    )
+    conn.commit()
+    return jsonify({"ok": True, "cnj": cnj, "tipo": "publicos", "cached": False, "items": items, "links": links, "paginator": paginator, "updated_at": now})
+
+
+@app.get("/processos/<path:cnj>/autos")
+def api_autos_v2(cnj: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ inválido"}), 422
+
+    limit_n = 100 if int(request.args.get("limit") or 50) == 100 else 50
+    page_n = max(1, int(request.args.get("page") or 1))
+
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT items_json, links_json, paginator_json, updated_at FROM docs_v2_cache WHERE cnj=? AND tipo=? AND limit_n=? AND page_n=?",
+        (cnj, "autos", limit_n, page_n),
+    )
+    row = cur.fetchone()
+    if row:
+        items_json, links_json, paginator_json, updated_at = row
+        return jsonify({
+            "ok": True, "cnj": cnj, "tipo": "autos", "cached": True,
+            "items": json.loads(items_json),
+            "links": json.loads(links_json) if links_json else None,
+            "paginator": json.loads(paginator_json) if paginator_json else None,
+            "updated_at": updated_at,
+        })
+
+    try:
+        data = client.listar_autos_v2(cnj, limit=limit_n, page=page_n)
+    except Exception as e:
+        return jsonify({"ok": False, "cnj": cnj, "error": str(e)}), 502
+
+    items = data.get("items") if isinstance(data, dict) else []
+    if not isinstance(items, list):
+        items = []
+    links = data.get("links") if isinstance(data, dict) else None
+    paginator = data.get("paginator") if isinstance(data, dict) else None
+
+    now = utcnow_iso()
+    cur.execute(
+        "INSERT OR REPLACE INTO docs_v2_cache(cnj,tipo,limit_n,page_n,items_json,links_json,paginator_json,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+        (
+            cnj, "autos", limit_n, page_n,
+            json.dumps(items, ensure_ascii=False),
+            json.dumps(links, ensure_ascii=False) if links else None,
+            json.dumps(paginator, ensure_ascii=False) if paginator else None,
+            now,
+        ),
+    )
+    conn.commit()
+    return jsonify({"ok": True, "cnj": cnj, "tipo": "autos", "cached": False, "items": items, "links": links, "paginator": paginator, "updated_at": now})
+
+
+@app.post("/processos/<path:cnj>/solicitar-atualizacao")
+def api_solicitar_atualizacao_v2(cnj: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ inválido"}), 422
+
+    payload = request.get_json(silent=True) or {}
+    tipo = (payload.get("tipo") or "publicos").strip().lower()
+    # Mapeia "publicos"/"autos" para os valores que a API do Escavador aceita
+    tipo_atualizacao = "RESTRITO" if tipo == "autos" else "PUBLICA"
+    send_callback = 1 if payload.get("enviar_callback") else 0
+
+    try:
+        resp = client.solicitar_atualizacao_v2(
+            cnj,
+            tipo_atualizacao=tipo_atualizacao,
+            send_callback=send_callback,
+            usuario=payload.get("usuario"),
+            senha=payload.get("senha"),
+            certificado_id=payload.get("certificado_id"),
+            documentos_especificos=payload.get("documentos_especificos"),
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "cnj": cnj, "tipo": tipo, "error": str(e)}), 502
+
+    now = utcnow_iso()
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO updates_v2(cnj,tipo,request_json,response_json,status_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+        (cnj, tipo, json.dumps(payload, ensure_ascii=False), json.dumps(resp, ensure_ascii=False), None, None, now, now),
+    )
+    conn.commit()
+    return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "response": resp})
+
+
+@app.get("/processos/<path:cnj>/solicitar-status")
+def api_solicitar_status_v2(cnj: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ inválido"}), 422
+
+    tipo = (request.args.get("tipo") or "publicos").strip().lower()
+    try:
+        st = client.status_atualizacao_v2(cnj)
+    except Exception as e:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT status_json, status, updated_at FROM updates_v2 WHERE cnj=? AND tipo=?", (cnj, tipo))
+        row = cur.fetchone()
+        if row:
+            status_json, status_s, updated_at = row
+            return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "cached": True, "status": status_s, "status_json": json.loads(status_json) if status_json else None, "updated_at": updated_at, "warn": str(e)})
+        return jsonify({"ok": False, "cnj": cnj, "tipo": tipo, "error": str(e)}), 502
+
+    status_s = None
+    if isinstance(st, dict):
+        status_s = st.get("status") or st.get("estado") or st.get("state")
+
+    now = utcnow_iso()
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO updates_v2(cnj,tipo,request_json,response_json,status_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+        (cnj, tipo, None, None, json.dumps(st, ensure_ascii=False), status_s, now, now),
+    )
+    conn.commit()
+    return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "cached": False, "status": status_s, "status_json": st, "updated_at": now})
+
+
+@app.get("/processos/<path:cnj>/documentos/<path:key>")
+def api_download_documento_v2(cnj: str, key: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ inválido"}), 422
+    try:
+        r = client.baixar_documento_pdf_v2(cnj, key)
+    except Exception as e:
+        return jsonify({"ok": False, "cnj": cnj, "error": str(e)}), 502
+
+    filename = f"documento_{cnj}.pdf"
+    headers = {
+        "Content-Type": r.headers.get("Content-Type", "application/pdf"),
+        "Content-Disposition": r.headers.get("Content-Disposition", f'attachment; filename="{filename}"'),
+    }
+    return Response(r.content, status=200, headers=headers)
+
+
+@app.get("/ui/docs-v2/<path:cnj>")
+def ui_docs_v2(cnj: str):
+    if not CNJ_REGEX.fullmatch(cnj):
+        return "CNJ inválido", 422
+
+    esc_map_js = json.dumps({"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"})
+
+    html = f"""<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Documentos v2 - {cnj}</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body{{background:#0b1220;color:#e6e6e6}}
+    .muted{{color:#9aa4b2}}
+    a{{color:#8bd3ff}}
+  </style>
+</head>
+<body class="p-3">
+  <div class="container">
+    <div class="d-flex align-items-center justify-content-between mb-3">
+      <div>
+        <div class="h4 mb-0">Documentos (Escavador v2)</div>
+        <div class="muted small">{cnj}</div>
+      </div>
+      <a class="btn btn-sm btn-outline-light" href="/ui/processo/{cnj}">Voltar ao processo</a>
+    </div>
+
+    <div class="card bg-dark border-secondary mb-3">
+      <div class="card-body">
+        <div class="row g-2 align-items-end">
+          <div class="col-md-3">
+            <label class="form-label small muted">Tipo</label>
+            <select id="tipo" class="form-select form-select-sm bg-dark text-light border-secondary">
+              <option value="publicos">Documentos públicos</option>
+              <option value="autos">Autos (restritos)</option>
+            </select>
+          </div>
+          <div class="col-md-2">
+            <label class="form-label small muted">Limite</label>
+            <select id="limit" class="form-select form-select-sm bg-dark text-light border-secondary">
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </div>
+          <div class="col-md-2">
+            <label class="form-label small muted">Página</label>
+            <input id="page" class="form-control form-control-sm bg-dark text-light border-secondary" value="1"/>
+          </div>
+          <div class="col-md-5 text-end">
+            <button id="btnListar" class="btn btn-sm btn-outline-light">Listar</button>
+            <button id="btnSolicitar" class="btn btn-sm btn-warning">Solicitar atualização</button>
+          </div>
+
+          <div class="col-12" id="autosBox" style="display:none">
+            <hr class="border-secondary"/>
+            <div class="row g-2">
+              <div class="col-md-3">
+                <label class="form-label small muted">Usar certificado</label>
+                <select id="utilizar_certificado" class="form-select form-select-sm bg-dark text-light border-secondary">
+                  <option value="">(não informado)</option>
+                  <option value="1">Sim</option>
+                  <option value="0">Não</option>
+                </select>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small muted">certificado_id</label>
+                <input id="certificado_id" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="ex: 123"/>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small muted">Usuário</label>
+                <input id="usuario" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="login tribunal"/>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small muted">Senha</label>
+                <input id="senha" type="password" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="senha tribunal"/>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label small muted">documentos_especificos</label>
+                <input id="documentos_especificos" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="ex: INICIAIS"/>
+              </div>
+              <div class="col-md-6 d-flex align-items-end">
+                <div class="form-check">
+                  <input id="enviar_callback" class="form-check-input" type="checkbox"/>
+                  <label class="form-check-label small muted" for="enviar_callback">enviar_callback=1</label>
+                </div>
+              </div>
+            </div>
+            <div class="muted small mt-2">Autos exigem autenticação habilitada na sua conta Escavador.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="status" class="muted small mb-2"></div>
+    <div id="out" class="muted small">Clique em <b>Listar</b>.</div>
+  </div>
+
+  <script>
+    const CNJ = {json.dumps(cnj)};
+    // Obs: em f-strings do Python, chaves do JS entram como "format specifiers" se ficarem literais aqui.
+    // Para evitar dor de cabeça (e escapar aspas/backslashes), geramos um JSON string no Python e fazemos JSON.parse aqui.
+    const ESC_MAP = JSON.parse({json.dumps(json.dumps({"&":"&amp;","<":"&lt;",">":"&gt;",'"': "&quot;","'":"&#39;"}))});
+    const esc = (s)=>String(s||"").replace(/[&<>"']/g, c=>(ESC_MAP[c]||c));
+    function tipo(){{ return document.getElementById("tipo").value; }}
+    function showAutos(){{ document.getElementById("autosBox").style.display = (tipo()==="autos") ? "" : "none"; }}
+    document.getElementById("tipo").addEventListener("change", showAutos);
+    showAutos();
+
+    async function listar(){{
+      const t = tipo();
+      const limit = parseInt(document.getElementById("limit").value, 10);
+      const page = parseInt(document.getElementById("page").value || "1", 10);
+      const out = document.getElementById("out");
+      const st = document.getElementById("status");
+      out.textContent = "Carregando...";
+      st.textContent = "";
+      try{{
+        const url = (t==="autos")
+          ? `/processos/${{encodeURIComponent(CNJ)}}/autos?limit=${{limit}}&page=${{page}}`
+          : `/processos/${{encodeURIComponent(CNJ)}}/documentos-publicos?limit=${{limit}}&page=${{page}}`;
+        const r = await fetch(url);
+        const j = await r.json();
+        if(!j.ok) throw new Error(j.error || "Falha");
+        const items = j.items || [];
+        st.textContent = (j.cached ? "Cache: " : "Atualizado: ") + (j.updated_at || "");
+        if(!items.length){{ out.innerHTML = "<span class='muted'>Nenhum documento encontrado.</span>"; return; }}
+        const rows = items.map(it=>{{
+          const k = it.key ? encodeURIComponent(it.key) : "";
+          const dl = it.key ? `<a class="btn btn-sm btn-outline-light" href="/processos/${{encodeURIComponent(CNJ)}}/documentos/${{k}}">Baixar</a>` : "";
+          return `<tr>
+            <td><div class="fw-semibold">${{esc(it.titulo || it.descricao || "Documento")}}</div><div class="muted small">${{esc(it.descricao||"")}}</div></td>
+            <td class="small">${{esc(it.data||"")}}</td>
+            <td class="small">${{esc(it.tipo||"")}}</td>
+            <td class="small">${{esc(it.extensao_arquivo||"")}}</td>
+            <td class="small">${{it.quantidade_paginas==null?"":it.quantidade_paginas}}</td>
+            <td class="text-end">${{dl}}</td>
+          </tr>`;
+        }}).join("");
+        out.innerHTML = `<div class="table-responsive">
+          <table class="table table-dark table-hover align-middle">
+            <thead><tr><th>Título</th><th>Data</th><th>Tipo</th><th>Ext</th><th>Pág.</th><th></th></tr></thead>
+            <tbody>${{rows}}</tbody>
+          </table></div>`;
+      }}catch(e){{
+        out.innerHTML = `<span class="text-danger">Erro: ${{esc(e)}}</span>`;
+      }}
+    }}
+
+    async function solicitar(){{
+      const t = tipo();
+      const st = document.getElementById("status");
+      st.textContent = "Solicitando atualização...";
+      const body = {{tipo: t}};
+      if(document.getElementById("enviar_callback").checked) body.enviar_callback = 1;
+      if(t === "autos"){{
+        const uc = document.getElementById("utilizar_certificado").value;
+        if(uc==="1") body.utilizar_certificado = true;
+        if(uc==="0") body.utilizar_certificado = false;
+        const cid = document.getElementById("certificado_id").value;
+        if(cid) body.certificado_id = parseInt(cid,10);
+        const u = document.getElementById("usuario").value;
+        const p = document.getElementById("senha").value;
+        const de = document.getElementById("documentos_especificos").value;
+        if(u) body.usuario = u;
+        if(p) body.senha = p;
+        if(de) body.documentos_especificos = de;
+      }}
+      try{{
+        const r = await fetch(`/processos/${{encodeURIComponent(CNJ)}}/solicitar-atualizacao`, {{
+          method:"POST",
+          headers:{{"Content-Type":"application/json"}},
+          body: JSON.stringify(body)
+        }});
+        const j = await r.json();
+        if(!j.ok) throw new Error(j.error || "Falha");
+        st.textContent = "Solicitação enviada. Consultando status...";
+        pollStatus();
+      }}catch(e){{
+        st.innerHTML = `<span class="text-danger">Erro: ${{esc(e)}}</span>`;
+      }}
+    }}
+
+    let timer=null;
+    async function pollStatus(){{
+      const t = tipo();
+      const st = document.getElementById("status");
+      try{{
+        const r = await fetch(`/processos/${{encodeURIComponent(CNJ)}}/solicitar-status?tipo=${{encodeURIComponent(t)}}`);
+        const j = await r.json();
+        if(!j.ok) throw new Error(j.error || "Falha");
+        const s = (j.status || (j.status_json && (j.status_json.status || j.status_json.estado || j.status_json.state)) || "PENDENTE");
+        st.innerHTML = `Status: <b>${{esc(s)}}</b>`;
+        const ss = String(s).toUpperCase();
+        if(ss.includes("SUCESSO") || ss.includes("SUCCESS")){{ clearTimeout(timer); timer=null; listar(); return; }}
+        if(ss.includes("ERRO") || ss.includes("ERROR") || ss.includes("FALHA") || ss.includes("FAILED")){{ clearTimeout(timer); timer=null; return; }}
+      }}catch(e){{
+        st.innerHTML = `<span class="text-danger">Erro status: ${{esc(e)}}</span>`;
+        clearTimeout(timer); timer=null; return;
+      }}
+      timer = setTimeout(pollStatus, 3000);
+    }}
+
+    document.getElementById("btnListar").addEventListener("click", (e)=>{{e.preventDefault(); listar();}});
+    document.getElementById("btnSolicitar").addEventListener("click", (e)=>{{e.preventDefault(); solicitar();}});
+  </script>
+</body>
+</html>"""
+    return html
+
+
+@app.get("/processos/<path:cnj>/movimentacoes")
+def get_movs(cnj: str):
+    limit = int(request.args.get("limit", "50"))
+    offset = int(request.args.get("offset", "0"))
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) as c FROM eventos_mov WHERE cnj=?", (cnj,))
+    total = int(cur.fetchone()["c"])
+    cur.execute(
+        """SELECT id, data, tipo, tipo_inferido, texto, created_at
+           FROM eventos_mov
+           WHERE cnj=?
+           ORDER BY COALESCE(data, created_at) DESC
+           LIMIT ? OFFSET ?""",
+        (cnj, limit, offset),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify({"ok": True, "cnj": cnj, "total": total, "limit": limit, "offset": offset, "items": rows})
+
+
+@app.get("/processos/<path:cnj>/movimentacoes/busca")
+def search_movs(cnj: str):
+    q = (request.args.get("q") or "").strip()
+    tipo = (request.args.get("tipo") or "").strip().upper()
+    limit = int(request.args.get("limit", "50"))
+    offset = int(request.args.get("offset", "0"))
+
+    where = ["cnj=?"]
+    params: List[Any] = [cnj]
+
+    if q:
+        where.append("texto LIKE ?")
+        params.append(f"%{q}%")
+    if tipo:
+        where.append("(UPPER(COALESCE(tipo,''))=? OR UPPER(COALESCE(tipo_inferido,''))=?)")
+        params.extend([tipo, tipo])
+
+    where_sql = " AND ".join(where)
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(f"SELECT COUNT(*) as c FROM eventos_mov WHERE {where_sql}", params)
+    total = int(cur.fetchone()["c"])
+
+    cur.execute(
+        f"""SELECT id, data, tipo, tipo_inferido, texto, created_at
+            FROM eventos_mov
+            WHERE {where_sql}
+            ORDER BY COALESCE(data, created_at) DESC
+            LIMIT ? OFFSET ?""",
+        params + [limit, offset],
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify({"ok": True, "cnj": cnj, "total": total, "limit": limit, "offset": offset, "items": rows})
+
+
+# ============================================================
+# Webhook + Inbox
+# ============================================================
+@app.post("/webhook/escavador")
+def webhook_escavador():
+    if WEBHOOK_AUTH_TOKEN:
+        incoming = (request.headers.get("Authorization") or "").strip()
+        if incoming != WEBHOOK_AUTH_TOKEN:
+            abort(401, description="Authorization inválido no webhook.")
+    payload = request.get_json(force=True, silent=False) or {}
+    inserted, h = ingest_callback("webhook", payload)
+    return jsonify({"ok": True, "inserted": inserted, "payload_hash": h})
+
+
+@app.route("/poll/run-once", methods=["GET","POST"])
+def poll_run_once():
+    require_token_configured()
+    data = client.listar_callbacks(limit=100, page=1)  # type: ignore
+    callbacks = extract_list(data)
+
+    inserted = 0
+    for cb in callbacks:
+        ins, _ = ingest_callback("poll", cb)
+        if ins:
+            inserted += 1
+
+    pr = process_inbox_once(client, max_items=50)  # type: ignore
+    return jsonify({"ok": True, "inserted": inserted, **pr})
+
+
+# ============================================================
+# UI (web) - Blue Service skin
+# ============================================================
+
+UI_BASE = """
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Blue Service | Monitor Escavador</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    :root{
+      --bs-primary: #3050A0;
+      --bs-primary-rgb: 48,80,160;
+      --ink: #0f172a;
+      --muted: #5b6b86;
+      --bg: #F4F7FF;
+      --card: #ffffff;
+      --border: rgba(30,43,90,.14);
+      --shadow: 0 10px 26px rgba(30,43,90,.12);
+      --accent: #F01040;
+      --accent2: #7C3AED;
+      --chip: #EEF3FF;
+      --chipText: #28407e;
+      --navbg: rgba(48,80,160,.06);
+      --ok: #16a34a;
+      --warn: #f59e0b;
+    }
+    body { background: var(--bg); color: var(--ink); }
+    .navbar { background: linear-gradient(90deg, rgba(48,80,160,.98), rgba(30,43,90,.98)); }
+    .navbar a { color: #fff !important; text-decoration:none; }
+    .pill {
+      border: 1px solid rgba(255,255,255,.25);
+      background: rgba(255,255,255,.10);
+      border-radius: 999px;
+      padding: .35rem .75rem;
+      text-decoration: none;
+    }
+    .pill:hover { background: rgba(255,255,255,.16); }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 18px; box-shadow: var(--shadow); }
+    .muted { color: var(--muted); }
+    a { color: var(--bs-primary); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .wrap { white-space: pre-wrap; }
+    .btn-brand {
+      background: linear-gradient(90deg, var(--bs-primary), #2b63c9);
+      border: 0; color: #fff; font-weight: 650;
+      border-radius: 12px;
+      box-shadow: 0 10px 20px rgba(48,80,160,.22);
+    }
+    .btn-brand:hover { filter: brightness(1.04); }
+    .btn-accent {
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      border: 0; color: #fff; font-weight: 650;
+      border-radius: 12px;
+      box-shadow: 0 10px 20px rgba(240,16,64,.18);
+    }
+    .btn-accent:hover { filter: brightness(1.04); }
+    .btn-mini { padding: .28rem .55rem; font-size: .85rem; border-radius: 10px; }
+    .chip {
+      display: inline-flex; align-items: center; gap: .4rem;
+      padding: .35rem .6rem; border-radius: 999px;
+      background: var(--chip); border: 1px solid rgba(48,80,160,.18);
+      color: var(--chipText); font-size: .88rem;
+    }
+
+    .chip { max-width: 100%; min-width: 0; overflow: hidden; }
+    .chip .chip-val { min-width: 0; max-width: 100%; display: inline-block; }
+    .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .wrap-any { overflow-wrap: anywhere; word-break: break-word; }
+    .badge-soft {
+      background: rgba(48,80,160,.08);
+      border: 1px solid rgba(48,80,160,.18);
+      color: #27407d;
+      border-radius: 14px;
+    }
+    .nav-tabs { border-bottom: 1px solid var(--border); }
+    .nav-tabs .nav-link { border-radius: 14px 14px 0 0; color: #2a3a62; background: transparent; border: 1px solid transparent; }
+    .nav-tabs .nav-link.active { background: #fff; border-color: var(--border); color: var(--bs-primary); }
+    .nav-pills .nav-link { border-radius: 999px; background: var(--navbg); color: #2a3a62; }
+    .nav-pills .nav-link.active { background: var(--bs-primary); color: #fff; }
+    .table td, .table th { border-color: var(--border); }
+    .kpi {
+      border-radius: 16px;
+      border: 1px solid rgba(48,80,160,.16);
+      background: linear-gradient(180deg, rgba(48,80,160,.08), rgba(48,80,160,.03));
+      padding: 12px;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      overflow: hidden;
+    }
+.kpi-click{ cursor:pointer; }
+.kpi-click:hover{ filter: brightness(0.98); box-shadow: 0 6px 18px rgba(0,0,0,.08); }
+.kpi-click:active{ transform: translateY(1px); }
+
+    .kpi .label { color: var(--muted); font-size: .86rem; }
+    .kpi .value { font-weight: 750; font-size: 1.0rem; line-height: 1.15; overflow: hidden; text-overflow: ellipsis; }
+    .kpi .value.wrap { white-space: normal; overflow-wrap: anywhere; word-break: break-word; font-size: .95rem; }
+    details > summary { cursor: pointer; }
+
+    .sticky-side{
+      position: sticky;
+      top: 16px;
+      z-index: 3;
+    }
+    .side-card{
+      border-radius: 18px;
+      border: 1px solid rgba(48,80,160,.18);
+      background: linear-gradient(180deg, rgba(255,255,255,1), rgba(255,255,255,.92));
+      box-shadow: var(--shadow);
+    }
+    .side-title{ font-weight: 800; }
+    .divider{ border-color: var(--border); }
+    .chip-click{
+      cursor: pointer;
+      user-select: none;
+      transition: transform .05s ease-in-out, filter .15s ease-in-out;
+    }
+    .chip-click:hover{ filter: brightness(0.98); }
+    .chip-click:active{ transform: scale(0.98); }
+    .chip-active{
+      background: rgba(48,80,160,.12);
+      border-color: rgba(48,80,160,.35);
+      color: #1f3f8b;
+      font-weight: 750;
+    }
+
+    .timeline-day{
+      margin-top: 14px;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(48,80,160,.18);
+      background: rgba(48,80,160,.05);
+      display:flex;
+      justify-content: space-between;
+      align-items:center;
+      gap: 8px;
+    }
+    .tl-item{
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 12px;
+      background: #fff;
+      box-shadow: 0 8px 18px rgba(30,43,90,.06);
+    }
+    .tl-top{
+      display:flex;
+      justify-content: space-between;
+      align-items:flex-start;
+      gap: 12px;
+      margin-bottom: 6px;
+    }
+    .tl-icon{
+      width: 34px;
+      height: 34px;
+      border-radius: 12px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      background: rgba(48,80,160,.08);
+      border: 1px solid rgba(48,80,160,.18);
+      flex: 0 0 auto;
+    }
+    .tl-title{
+      font-weight: 800;
+      color: #1f2a55;
+    }
+    .tl-meta{ color: var(--muted); font-size: .86rem; }
+    .badge-today{
+      background: rgba(22,163,74,.12);
+      border: 1px solid rgba(22,163,74,.30);
+      color: #166534;
+      border-radius: 999px;
+      padding: .18rem .55rem;
+      font-weight: 750;
+      font-size: .78rem;
+      white-space: nowrap;
+    }
+    .badge-new{
+      background: rgba(245,158,11,.14);
+      border: 1px solid rgba(245,158,11,.34);
+      color: #92400e;
+      border-radius: 999px;
+      padding: .18rem .55rem;
+      font-weight: 750;
+      font-size: .78rem;
+      white-space: nowrap;
+    }
+/* Toasts */
+#toast-host{
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 1080;
+  display:flex;
+  flex-direction:column;
+  gap: 10px;
+  pointer-events: none;
+}
+.toast{
+  pointer-events: auto;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+.toast .toast-header{
+  border-top-left-radius: 16px;
+  border-top-right-radius: 16px;
+  background: rgba(48,80,160,.06);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Inline banners */
+.inline-banner .alert{
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+}
+
+/* md-body — Markdown rendered content */
+.md-body h1, .md-body h2, .md-body h3 { color: var(--bs-primary); margin-top: 1.4rem; margin-bottom: .5rem; }
+.md-body table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; font-size: .93rem; }
+.md-body th, .md-body td { border: 1px solid var(--border); padding: .45rem .7rem; text-align: left; }
+.md-body th { background: rgba(48,80,160,.12); font-weight: 600; }
+.md-body tr:nth-child(even) td { background: rgba(255,255,255,.03); }
+.md-body code { background: rgba(48,80,160,.13); border-radius: 5px; padding: .15rem .4rem; font-size: .9em; }
+.md-body pre { background: #0d1525; border: 1px solid var(--border); border-radius: 10px; padding: 1rem; overflow-x: auto; }
+.md-body blockquote { border-left: 3px solid var(--bs-primary); padding-left: 1rem; color: var(--muted); margin: .8rem 0; }
+.md-body hr { border-color: var(--border); margin: 1.5rem 0; }
+
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<script>
+(function(){
+  // Helpers need to exist BEFORE any page scripts (body content may call them immediately)
+  window.clearInlineBanner = window.clearInlineBanner || function(id){
+    try{ var host=document.getElementById(id); if(host) host.innerHTML=""; }catch(e){}
+  };
+  window.showInlineBanner = window.showInlineBanner || function(id, kind, title, msg){
+    try{
+      var host=document.getElementById(id); if(!host) return;
+      var k=(kind||"info");
+      var t=title ? ("<b>"+title+"</b>") : "";
+      var m=msg ? ("<div class='mt-1'>"+msg+"</div>") : "";
+      host.innerHTML = "<div class='alert alert-"+k+" mb-2'>"+t+m+"</div>";
+    }catch(e){}
+  };
+
+  window.showToast = window.showToast || function(kind, title, msg, delayMs){
+    try{
+      var host=document.getElementById("toastHost");
+      if(!host){ console.log("[toast]", kind, title, msg); return; }
+      var k=(kind||"info");
+      var icon = (k==="success")?"✅":(k==="danger")?"⛔":(k==="warning")?"⚠️":"ℹ️";
+      var id="t"+Math.random().toString(16).slice(2);
+      var html = `
+        <div id="${id}" class="toast align-items-center text-bg-${k} border-0 mb-2" role="alert" aria-live="assertive" aria-atomic="true">
+          <div class="d-flex">
+            <div class="toast-body">
+              <div><span class="me-2">${icon}</span><b>${title||""}</b></div>
+              <div class="small mt-1">${msg||""}</div>
+            </div>
+            <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+          </div>
+        </div>`;
+      host.insertAdjacentHTML("beforeend", html);
+      var el=document.getElementById(id);
+      var t=new bootstrap.Toast(el, { delay: (delayMs||4500) });
+      el.addEventListener("hidden.bs.toast", ()=>{ try{ el.remove(); }catch(e){} });
+      t.show();
+    }catch(e){
+      console.log("[toast-fallback]", kind, title, msg);
+    }
+  };
+
+  // Navbar badge (global pending alerts)
+  async function updateNavBadge(){
+    try{
+      const r = await fetch("/ui/api/dashboard/metrics?scope=global");
+      const j = await r.json();
+      const n = (j && j.ok !== false && (j.alertas_global ?? j.alertas ?? 0)) || 0;
+      const b = document.getElementById("navBadge");
+      if(!b) return;
+      if(n > 0){
+        b.style.display = "inline-block";
+        b.textContent = String(n);
+      } else {
+        b.style.display = "none";
+        b.textContent = "";
+      }
+    }catch(e){}
+  }
+  document.addEventListener("DOMContentLoaded", function(){
+    updateNavBadge();
+    setInterval(updateNavBadge, 15000);
+  });
+
+
+})();
+</script>
+<div class="toast-container position-fixed top-0 end-0 p-3" style="z-index:1080" id="toastHost"></div>
+<nav class="navbar navbar-dark">
+  <div class="container py-2 d-flex justify-content-between align-items-center">
+    <div>
+      <div class="h4 mb-0">Blue Service | Monitor Escavador</div>
+      <div class="small" style="opacity:.9">Flask • SQLite • Movimentações em timeline</div>
+    </div>
+    <div class="d-flex gap-2">
+      <a class="pill" href="/ui">Dashboard</a>
+      <a class="pill" href="/ui/watchlist">Watch-List</a>
+      <a class="pill" href="/ui/admin">Admin <span id="navBadge" class="badge bg-danger ms-1" style="display:none"></span></a>
+      <a class="pill" href="/health">Health</a>
+      <a class="pill" href="/ui/documentacao">Documentação</a>
+    </div>
+  </div>
+</nav>
+<div id="toast-host" aria-live="polite" aria-atomic="true"></div>
+<div class="container py-4">
+  {{ body|safe }}
+</div>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+(function(){
+  let _toastSeq = 0;
+  window.showToast = function(kind, title, msg, delayMs){
+    const host = document.getElementById("toast-host");
+    if(!host) return;
+    const id = "t" + (++_toastSeq);
+    const delay = (typeof delayMs === "number" ? delayMs : 4500);
+    const icon = (kind==="success" ? "✅" : kind==="warning" ? "⚠️" : kind==="danger" ? "⛔" : "ℹ️");
+    const html = `
+    <div id="${id}" class="toast" role="status" aria-live="polite" aria-atomic="true">
+      <div class="toast-header">
+        <span class="me-2">${icon}</span>
+        <strong class="me-auto">${title || "Aviso"}</strong>
+        <small class="text-muted">agora</small>
+        <button type="button" class="btn-close ms-2 mb-1" data-bs-dismiss="toast" aria-label="Close"></button>
+      </div>
+      <div class="toast-body">${msg || ""}</div>
+    </div>`;
+    host.insertAdjacentHTML("afterbegin", html);
+    const el = document.getElementById(id);
+    const t = bootstrap.Toast.getOrCreateInstance(el, { delay: delay });
+    el.addEventListener("hidden.bs.toast", ()=>{ try{ el.remove(); }catch(e){} });
+    t.show();
+  }
+
+  window.clearInlineBanner = function(id){
+    var host = document.getElementById(id);
+    if(host) host.innerHTML = "";
+  };
+  window.showInlineBanner = function(id, kind, title, msg){
+    var host = document.getElementById(id);
+    if(!host) return;
+    var k = (kind||"info");
+    var t = title ? ("<b>"+title+"</b>") : "";
+    var m = msg ? ("<div class='mt-1'>"+msg+"</div>") : "";
+    host.innerHTML = "<div class='alert alert-"+k+" mb-2'>"+t+m+"</div>";
+  };
+})();
+</script>
+
+</body>
+</html>
+"""
+
+
+def ui_alert(kind: str, title: str, msg: str) -> str:
+    return (
+        "<div class='alert alert-" + kind + "' style='border-radius:16px; box-shadow: var(--shadow);'>"
+        "<b>" + title + "</b><div class='mt-1'>" + msg + "</div></div>"
+    )
+# ----------------------------
+# Runtime config: auto-discover toggle
+# ----------------------------
+@app.get("/admin/discover")
+def get_discover_config():
+    return jsonify(
+        {
+            "ok": True,
+            "auto_discover_enabled": bool(AUTO_DISCOVER_ENABLED),
+            "discover_interval_seconds": DISCOVER_INTERVAL_SECONDS,
+            "discover_limit_per_doc": DISCOVER_LIMIT_PER_DOC,
+            "discover_only_if_no_links": bool(DISCOVER_ONLY_IF_NO_LINKS),
+            "discover_max_docs_per_cycle": DISCOVER_MAX_DOCS_PER_CYCLE,
+            "discover_state": _get_discover_state(),
+        }
+    )
+
+
+@app.post("/admin/discover")
+def set_discover_config():
+    """
+    Atualiza configurações do auto-discover em runtime (sem reiniciar).
+    Aceita JSON com qualquer combinação de:
+      - enabled: bool
+      - discover_interval_seconds: int (>=10 recomendado)
+      - discover_limit_per_doc: int (>=1)
+      - discover_only_if_no_links: bool
+      - discover_max_docs_per_cycle: int (>=1)
+    """
+    global AUTO_DISCOVER_ENABLED, DISCOVER_INTERVAL_SECONDS, DISCOVER_LIMIT_PER_DOC, DISCOVER_ONLY_IF_NO_LINKS, DISCOVER_MAX_DOCS_PER_CYCLE
+
+    payload = request.get_json(force=True, silent=True) or {}
+    if not isinstance(payload, dict):
+        abort(400, description="Payload inválido (JSON objeto esperado).")
+
+    def _as_int(name: str, v: Any, min_v: int) -> int:
+        try:
+            iv = int(v)
+        except Exception:
+            abort(400, description=f"Campo '{name}' deve ser inteiro.")
+        if iv < min_v:
+            abort(400, description=f"Campo '{name}' deve ser >= {min_v}.")
+        return iv
+
+    changed: Dict[str, Any] = {}
+
+    if "enabled" in payload:
+        AUTO_DISCOVER_ENABLED = bool(payload.get("enabled"))
+        changed["auto_discover_enabled"] = bool(AUTO_DISCOVER_ENABLED)
+
+    if "discover_interval_seconds" in payload:
+        DISCOVER_INTERVAL_SECONDS = _as_int("discover_interval_seconds", payload.get("discover_interval_seconds"), 1)
+        changed["discover_interval_seconds"] = DISCOVER_INTERVAL_SECONDS
+
+    if "discover_limit_per_doc" in payload:
+        DISCOVER_LIMIT_PER_DOC = _as_int("discover_limit_per_doc", payload.get("discover_limit_per_doc"), 1)
+        changed["discover_limit_per_doc"] = DISCOVER_LIMIT_PER_DOC
+
+    if "discover_max_docs_per_cycle" in payload:
+        DISCOVER_MAX_DOCS_PER_CYCLE = _as_int("discover_max_docs_per_cycle", payload.get("discover_max_docs_per_cycle"), 1)
+        changed["discover_max_docs_per_cycle"] = DISCOVER_MAX_DOCS_PER_CYCLE
+
+    if "discover_only_if_no_links" in payload:
+        DISCOVER_ONLY_IF_NO_LINKS = bool(payload.get("discover_only_if_no_links"))
+        changed["discover_only_if_no_links"] = bool(DISCOVER_ONLY_IF_NO_LINKS)
+
+    if not changed:
+        abort(400, description="Informe ao menos um campo para atualizar.")
+
+    logger.info("Auto-discover config updated: %s", changed)
+
+    return jsonify(
+        {
+            "ok": True,
+            "auto_discover_enabled": bool(AUTO_DISCOVER_ENABLED),
+            "discover_interval_seconds": DISCOVER_INTERVAL_SECONDS,
+            "discover_limit_per_doc": DISCOVER_LIMIT_PER_DOC,
+            "discover_only_if_no_links": bool(DISCOVER_ONLY_IF_NO_LINKS),
+            "discover_max_docs_per_cycle": DISCOVER_MAX_DOCS_PER_CYCLE,
+            "discover_state": _get_discover_state(),
+            "changed": changed,
+        }
+    )
+
+
+
+
+
+# ----------------------------
+# Auto-discover: status + run once (manual trigger)
+# ----------------------------
+@app.get("/admin/discover/status")
+def discover_status():
+    st = _get_discover_state()
+    return jsonify({"ok": True, "state": st})
+
+@app.post("/admin/discover/run-once")
+def discover_run_once():
+    require_token_configured()
+    if client is None:
+        return jsonify({"ok": False, "error": "CLIENT_NOT_READY"}), 500
+
+    # dispara em background para não travar a UI
+    st = _get_discover_state()
+    if st.get("running"):
+        return jsonify({"ok": False, "error": "ALREADY_RUNNING", "state": st}), 409
+
+    def _bg():
+        try:
+            run_discover_cycle(client, trigger="manual")  # type: ignore
+        except Exception:
+            logger.exception("Manual discover cycle crashed")
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return jsonify({"ok": True, "started": True, "state": _get_discover_state()})
+
+
+@app.post("/admin/costs/import")
+def admin_costs_import():
+    """
+    Importa extrato do Escavador (linhas como):
+    GET /api/v2/processos/numero_cnj/XXXX  R$ -0,04  16/02/2026 19:03
+    """
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "Texto vazio"}), 400
+
+    inserted = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = EXTRATO_LINE_RE.match(line)
+        if not m:
+            continue
+        method, endpoint, val_s, d_s, t_s = m.groups()
+        try:
+            cost = abs(_parse_brl_value(val_s))
+        except Exception:
+            continue
+        try:
+            dt = datetime.strptime(d_s + " " + t_s, "%d/%m/%Y %H:%M").replace(tzinfo=timezone.utc).isoformat()
+        except Exception:
+            dt = utcnow_iso()
+
+        cnj = _extract_cnj_from_endpoint(endpoint)
+        doc = _extract_doc_from_endpoint(endpoint)
+
+        record_api_usage_real(ts_iso=dt, doc=doc, cnj=cnj, method=method, endpoint=endpoint, cost_brl=cost, raw_line=line)
+        inserted += 1
+
+    return jsonify({"ok": True, "inserted": inserted})
+
+@app.post("/admin/costs/import-xlsx")
+def admin_costs_import_xlsx():
+    """Importa XLSX exportado do painel do Escavador (Relatório de Consumo da API).
+    Espera colunas como: URL, Método HTTP, Saldo utilizado, Data de Utilização.
+    Faz dedupe via fingerprint (UNIQUE) para não importar o mesmo dado mais de uma vez.
+    """
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "Arquivo não enviado (campo 'file')"}), 400
+    f = request.files["file"]
+    if not f or not f.filename:
+        return jsonify({"ok": False, "error": "Arquivo inválido"}), 400
+
+    imported_at = utcnow_iso()
+    try:
+        wb = openpyxl.load_workbook(f, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+
+        # map headers (case-insensitive, tolerant)
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(1, c).value
+            if v is None:
+                continue
+            headers[str(v).strip().lower()] = c
+
+        def h(*names):
+            for n in names:
+                c = headers.get(n.lower())
+                if c:
+                    return c
+            return None
+
+        col_url = h("url")
+        col_method = h("método http", "metodo http", "método", "metodo")
+        col_cost = h("saldo utilizado", "saldo Utilizado")
+        col_ts = h("data de utilização", "data de utilizacao", "data de utilização", "data de utilização")
+
+        if not (col_url and col_method and col_cost and col_ts):
+            return jsonify({
+                "ok": False,
+                "error": "XLSX sem colunas esperadas. Preciso de URL, Método HTTP, Saldo utilizado, Data de Utilização.",
+                "found_headers": list(headers.keys())
+            }), 400
+
+        inserted = 0
+        skipped = 0
+        errors = 0
+
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            # garante coluna/índice (para DBs antigos)
+            try:
+                cur.execute("PRAGMA table_info(api_usage_real)")
+                cols = [r[1] for r in cur.fetchall()]
+                if "fingerprint" not in cols:
+                    cur.execute("ALTER TABLE api_usage_real ADD COLUMN fingerprint TEXT")
+                if "imported_at" not in cols:
+                    cur.execute("ALTER TABLE api_usage_real ADD COLUMN imported_at TEXT")
+                if "source" not in cols:
+                    cur.execute("ALTER TABLE api_usage_real ADD COLUMN source TEXT")
+            except Exception:
+                pass
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_usage_real_fp ON api_usage_real (fingerprint)")
+
+            for r in range(2, ws.max_row + 1):
+                endpoint = ws.cell(r, col_url).value
+                method = ws.cell(r, col_method).value
+                cost = ws.cell(r, col_cost).value
+                ts = ws.cell(r, col_ts).value
+
+                if not endpoint or not method:
+                    continue
+
+                method_s = str(method).strip().upper()
+                if method_s.lower().startswith("total"):
+                    continue
+
+                try:
+                    cost_val = abs(float(cost))
+                except Exception:
+                    errors += 1
+                    continue
+
+                # ts pode vir como datetime ou string 'YYYY-MM-DD HH:MM:SS'
+                try:
+                    if hasattr(ts, "isoformat"):
+                        ts_iso = ts.replace(tzinfo=timezone.utc).isoformat()  # type: ignore
+                    else:
+                        ts_s = str(ts).strip()
+                        dt = datetime.strptime(ts_s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                        ts_iso = dt.isoformat()
+                except Exception:
+                    ts_iso = utcnow_iso()
+
+                endpoint_s = str(endpoint).strip()
+                cnj = _extract_cnj_from_endpoint(endpoint_s)
+                doc = _extract_doc_from_endpoint(endpoint_s)
+
+                raw_line = f"{method_s} {endpoint_s} R$ -{cost_val:.2f} {ts_iso}"
+                fp = _fingerprint_usage(ts_iso, method_s, endpoint_s, float(cost_val))
+
+                try:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO api_usage_real (ts, doc, cnj, method, endpoint, cost_brl, raw_line, fingerprint, imported_at, source) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (ts_iso, doc, cnj, method_s, endpoint_s, float(cost_val), raw_line[:800], fp, imported_at, "xlsx"),
+                    )
+                    if cur.rowcount == 1:
+                        inserted += 1
+                    else:
+                        skipped += 1
+                except Exception:
+                    errors += 1
+
+            conn.commit()
+
+        return jsonify({"ok": True, "inserted": inserted, "skipped": skipped, "errors": errors, "imported_at": imported_at})
+    except Exception as e:
+        logger.exception("Falha ao importar XLSX")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
+
+@app.post("/admin/costs/clear-real")
+def admin_costs_clear_real():
+    """Limpa todo o histórico REAL importado (api_usage_real)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM api_usage_real")
+            conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.exception("Falha ao limpar api_usage_real")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get("/ui")
+def ui_home():
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT id, doc, tipo_doc, created_at FROM watchlist ORDER BY id DESC LIMIT 200")
+    docs = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    cards = ""
+    if docs:
+        for d in docs:
+            doc = d["doc"]
+            cards += """
+            <div class="col-lg-6">
+              <div class="card p-3">
+                <div class="d-flex justify-content-between align-items-start">
+                  <div>
+                    <div class="muted small">""" + d["tipo_doc"] + """</div>
+                    <div class="h5 mb-1 mono">""" + doc + """</div>
+                    <div class="muted small">Criado em """ + d["created_at"] + """</div>
+                  </div>
+                  <div class="d-flex flex-column gap-2">
+                    <a class="btn btn-outline-primary btn-mini" href="/ui/admin">Admin</a>
+                    <button class="btn btn-outline-danger btn-mini" onclick="deleteDoc(""" + str(d["id"]) + """, '""" + doc + """')">Remover</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            """
+    else:
+        cards = """
+        <div class="col-12">
+          <div class="card p-4">
+            <div class="muted">Nenhum CPF/CNPJ na watchlist ainda. Cadastre no formulário ao lado.</div>
+          </div>
+        </div>
+        """
+
+    body = """
+    
+    <div id="dashboard" class="mb-4">
+      <div class="d-flex align-items-center justify-content-between mb-2">
+        <div>
+          <div class="muted small">Visão geral</div>
+          <h3 class="m-0">Dashboard</h3>
+        </div>
+        <div class="d-flex gap-2">
+          <a class="btn btn-outline-primary btn-mini" href="/ui/admin">Admin</a>
+          <a class="btn btn-outline-secondary btn-mini" href="/ui/costs">Custos</a>
+          <a class="btn btn-outline-secondary btn-mini" href="/health">Health</a>
+        </div>
+      </div>
+
+      <div id="bn-dash"></div>
+
+      <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+  <div class="muted">Escopo das métricas</div>
+  <div class="d-flex align-items-center gap-2">
+    <select id="dash-scope" class="form-select form-select-sm" style="min-width:260px; max-width:420px;"></select>
+    <button class="btn btn-sm btn-outline-primary" id="btn-dash-refresh">Atualizar</button>
+  </div>
+</div>
+<div class="row g-3" id="dash-kpis">
+        <div class="col-md-3"><div class="card p-3"><div class="muted">Docs monitorados</div><div class="h3 m-0" id="kpi-docs">-</div></div></div>
+        <div class="col-md-3"><div class="card p-3"><div class="muted">Processos vinculados</div><div class="h3 m-0" id="kpi-processos">-</div></div></div>
+        <div class="col-md-3"><div class="card p-3"><div class="muted">Movimentações salvas</div><div class="h3 m-0" id="kpi-movs">-</div></div></div>
+        <div class="col-md-3"><div class="card p-3"><div class="muted">Alertas pendentes</div><div class="h3 m-0" id="kpi-alertas">-</div></div></div>
+
+        <div class="col-md-3"><div class="card p-3"><div class="muted">Custo estimado hoje</div><div class="h3 m-0" id="kpi-cost-today">-</div></div></div>
+        <div class="col-md-3"><div class="card p-3"><div class="muted">Custo estimado mês</div><div class="h3 m-0" id="kpi-cost-month">-</div></div></div>
+
+        <div class="col-md-3"><div class="card p-3"><div class="muted">Custo real hoje</div><div class="h3 m-0" id="kpi-cost-real-today">-</div></div></div>
+        <div class="col-md-3"><div class="card p-3"><div class="muted">Custo real mês</div><div class="h3 m-0" id="kpi-cost-real-month">-</div></div></div>
+
+        <div class="col-md-3"><div class="card p-3"><div class="muted">Diferença hoje</div><div class="h3 m-0" id="kpi-cost-delta-today">-</div></div></div>
+        <div class="col-md-3"><div class="card p-3"><div class="muted">Diferença mês</div><div class="h3 m-0" id="kpi-cost-delta-month">-</div></div></div>
+      </div>
+
+      
+      <div class="row g-3 mt-1">
+        <div class="col-lg-7">
+          <div class="card p-3">
+            <div class="d-flex align-items-center justify-content-between">
+              <div>
+                <div class="fw-semibold">Movimentações salvas por dia</div>
+                <div class="muted small">Janela padrão: 14 dias (filtra quando você escolhe um CPF/CNPJ).</div>
+              </div>
+              <div class="d-flex align-items-center gap-2">
+                <select id="dash-days" class="form-select form-select-sm" style="width:110px;">
+                  <option value="7">7d</option>
+                  <option value="14" selected>14d</option>
+                  <option value="30">30d</option>
+                </select>
+              </div>
+            </div>
+            <div class="mt-2">
+              <canvas id="dash-chart" height="120"></canvas>
+            </div>
+            <div class="muted small mt-2" id="dash-chart-note"></div>
+          </div>
+        </div>
+        <div class="col-lg-5">
+          <div class="row g-3">
+            <div class="col-12">
+              <div class="card p-3">
+                <div class="fw-semibold">Operação</div>
+                <div class="muted small">Poll, Discover e último erro de API</div>
+                <div class="mt-2 d-flex flex-column gap-2">
+                  <div class="d-flex justify-content-between"><span class="muted">Poll</span><span id="ops-poll" class="mono small">-</span></div>
+                  <div class="d-flex justify-content-between"><span class="muted">Discover</span><span id="ops-discover" class="mono small">-</span></div>
+                  <div class="d-flex justify-content-between"><span class="muted">Último erro API</span><span id="ops-apierr" class="mono small">-</span></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-12">
+              <div class="card p-3">
+                <div class="fw-semibold">Top CNJs com mais alertas</div>
+                <div class="muted small">Ranking rápido (pendências).</div>
+                <div class="mt-2 small" id="dash-top-cnj">-</div>
+              </div>
+            </div>
+            <div class="col-12">
+              <div class="card p-3">
+                <div class="fw-semibold">Top CPF/CNPJ com mais alertas</div>
+                <div class="muted small">Docs com mais pendências.</div>
+                <div class="mt-2 small" id="dash-top-docs">-</div>
+              </div>
+            </div>
+            <div class="col-12">
+              <div class="card p-3">
+                <div class="fw-semibold">Atalhos</div>
+                <div class="d-flex gap-2 flex-wrap mt-2">
+                  <a class="btn btn-outline-secondary btn-mini" href="#dashboard">Topo</a>
+                  <a class="btn btn-outline-primary btn-mini" href="/ui/admin">Admin</a>
+                  <a class="btn btn-outline-secondary btn-mini" href="/ui/costs">Custos</a>
+                  <a class="btn btn-outline-secondary btn-mini" href="/health">Health</a>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="muted small mt-2">Atualiza a cada 5s (sem travar a tela).</div>
+    </div>
+
+    
+      <div class="card p-3 mt-3">
+        <div class="d-flex align-items-center justify-content-between">
+          <div>
+            <div class="fw-semibold">Resumo por CPF/CNPJ</div>
+            <div class="muted">Alertas pendentes e quantidade de processos vinculados (top 50).</div>
+          </div>
+        </div>
+        <div class="table-responsive mt-2">
+          <table class="table table-sm align-middle mb-0">
+            <thead><tr><th>Doc</th><th class="text-end">Processos</th><th class="text-end">Alertas</th></tr></thead>
+            <tbody id="dash-doc-rows"><tr><td colspan="3" class="muted">Carregando...</td></tr></tbody>
+          </table>
+        </div>
+      
+<div class="card p-3 mt-3" id="dash-alerts-panel">
+  <div class="d-flex align-items-start justify-content-between flex-wrap gap-2">
+    <div>
+      <div class="fw-semibold">Painel de alertas</div>
+      <div class="muted small">Mostra movimentações <b>pendentes</b> (não zeradas). Você pode filtrar e exportar.</div>
+    </div>
+    <div class="d-flex gap-2 flex-wrap">
+      <button class="btn btn-outline-secondary btn-mini" id="btnAlertsRefresh" type="button">Atualizar</button>
+      <a class="btn btn-outline-secondary btn-mini" id="btnAlertsExport" href="#" target="_blank" rel="noopener">Exportar CSV</a>
+    </div>
+  </div>
+
+  <div class="row g-2 mt-2 align-items-end">
+    <div class="col-md-3">
+      <label class="form-label small muted">Auto-refresh (segundos)</label>
+      <input class="form-control form-control-sm" id="alerts-interval" type="number" min="0" step="1" placeholder="Ex: 10" />
+      <div class="muted small">0 desliga.</div>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label small muted">Tipos (separado por vírgula)</label>
+      <input class="form-control form-control-sm" id="alerts-types" type="text" placeholder="Ex: SENTENCA,DECISAO,PENHORA" />
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small muted">Busca livre</label>
+      <input class="form-control form-control-sm" id="alerts-q" type="text" placeholder="Ex: penhora, SisbaJud..." />
+    </div>
+    <div class="col-md-2">
+      <div class="form-check mt-4">
+        <input class="form-check-input" type="checkbox" id="alerts-must-vp">
+        <label class="form-check-label small" for="alerts-must-vp">Só valor/penhora</label>
+      </div>
+    </div>
+  </div>
+
+  <div id="bn-alerts" class="mt-2"></div>
+
+  <div class="table-responsive mt-2" style="max-height: 420px; overflow:auto;">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr>
+          <th class="mono">ID</th>
+          <th>Quando</th>
+          <th>Doc</th>
+          <th>CNJ</th>
+          <th>Tipo</th>
+          <th>Texto</th>
+        </tr>
+      </thead>
+      <tbody id="dash-alert-rows"><tr><td colspan="6" class="muted">Carregando...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+</div>
+<script>
+    let dashChart = null;
+
+function _fmtOps(st){
+  if(!st) return '-';
+  const run = st.running ? 'rodando' : 'idle';
+  const fin = st.last_finished ? ('fim ' + st.last_finished.replace('T',' ').slice(0,19)) : 'n/a';
+  const err = st.last_error ? (' erro: ' + st.last_error) : '';
+  return run + ' • ' + fin + err;
+}
+
+async function refreshSeries(doc){
+  try{
+    const daysSel = document.getElementById('dash-days');
+    const days = daysSel ? (daysSel.value||'14') : '14';
+    const url = '/ui/api/dashboard/timeseries?days=' + encodeURIComponent(days) + (doc ? ('&doc=' + encodeURIComponent(doc)) : '');
+    const r = await fetch(url);
+    const j = await r.json();
+    if(!j.ok){
+      const note = document.getElementById('dash-chart-note');
+      if(note) note.textContent = 'Série indisponível: ' + (j.error||'');
+      return;
+    }
+    const labels = (j.labels||[]).map(d=>{
+      // d = YYYY-MM-DD
+      const parts = String(d).split('-');
+      return (parts.length===3) ? (parts[2]+'/'+parts[1]) : d;
+    });
+    const data = j.movs||[];
+    const ctx = document.getElementById('dash-chart');
+    if(!ctx) return;
+    if(dashChart){ dashChart.destroy(); dashChart = null; }
+    dashChart = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets: [{ label: 'Movimentações', data, tension: 0.25 }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+    });
+    const note = document.getElementById('dash-chart-note');
+    if(note) note.textContent = (doc?('Doc '+doc+' • '):'Global • ') + 'últimos ' + j.days + ' dias.';
+  }catch(e){
+    const note = document.getElementById('dash-chart-note');
+    if(note) note.textContent = 'Erro ao carregar série: ' + e.toString();
+  }
+}
+
+async function refreshDashboard(force=false){
+      try{
+        clearInlineBanner("bn-dash");
+
+        const sel = document.getElementById("dash-scope");
+        const doc = (sel && sel.value && sel.value !== "__global__") ? sel.value : "";
+        const url = doc ? ("/ui/api/dashboard/metrics?doc=" + encodeURIComponent(doc)) : "/ui/api/dashboard/metrics";
+
+        const r = await fetch(url);
+        const j = await r.json();
+        if(!j.ok){
+          showInlineBanner("bn-dash","warning","Métricas indisponíveis", esc(j.error || j.message || "Falha ao calcular métricas"));
+          return;
+        }
+
+        // Inicializa o seletor na primeira carga (usa a lista global se vier com docs_list)
+        if(sel && (!sel.options || sel.options.length === 0)){
+          const optG = document.createElement("option");
+          optG.value = "__global__";
+          optG.textContent = "Global (todos os docs)";
+          sel.appendChild(optG);
+
+          const list = Array.isArray(j.docs_list) ? j.docs_list : [];
+          for(const d of list){
+            const o = document.createElement("option");
+            o.value = d;
+            o.textContent = d;
+            sel.appendChild(o);
+          }
+          sel.value = "__global__";
+          sel.addEventListener("change", ()=>{ refreshDashboard(true); const doc2 = (sel.value && sel.value !== "__global__") ? sel.value : ""; setupAlertsAutoRefresh(doc2); });
+        }
+
+        // KPIs: se estiver filtrado por doc, usa per_doc; senão usa global
+        const scope = (doc && j.per_doc) ? j.per_doc : j;
+        document.getElementById("kpi-docs").textContent = doc ? (doc || "-") : String(j.docs ?? "-");
+        document.getElementById("kpi-processos").textContent = String(scope.processos ?? "-");
+        document.getElementById("kpi-movs").textContent = String(scope.movs ?? "-");
+        document.getElementById("kpi-alertas").textContent = String(scope.alertas ?? "-");
+        document.getElementById("kpi-cost-today").textContent = (scope.cost_today_brl != null) ? ("R$ " + Number(scope.cost_today_brl).toFixed(2).replace(".", ",")) : "-";
+        document.getElementById("kpi-cost-month").textContent = (scope.cost_month_brl != null) ? ("R$ " + Number(scope.cost_month_brl).toFixed(2).replace(".", ",")) : "-";
+
+        const realTodayEl = document.getElementById("kpi-cost-real-today");
+        const realMonthEl = document.getElementById("kpi-cost-real-month");
+        const deltaTodayEl = document.getElementById("kpi-cost-delta-today");
+        const deltaMonthEl = document.getElementById("kpi-cost-delta-month");
+
+        if(realTodayEl) realTodayEl.textContent = (scope.cost_real_today_brl != null) ? ("R$ " + Number(scope.cost_real_today_brl).toFixed(2).replace(".", ",")) : "-";
+        if(realMonthEl) realMonthEl.textContent = (scope.cost_real_month_brl != null) ? ("R$ " + Number(scope.cost_real_month_brl).toFixed(2).replace(".", ",")) : "-";
+
+        function _deltaFmt(v){
+          if(v == null || isNaN(Number(v))) return "-";
+          const n = Number(v);
+          const s = "R$ " + n.toFixed(2).replace(".", ",");
+          return (n > 0 ? ("+"+s) : s);
+        }
+        if(deltaTodayEl) deltaTodayEl.textContent = _deltaFmt(scope.cost_delta_today_brl);
+        if(deltaMonthEl) deltaMonthEl.textContent = _deltaFmt(scope.cost_delta_month_brl);
+
+        // Top CNJs
+        const topCnjEl = document.getElementById("dash-top-cnj");
+        if(topCnjEl){
+          const items = (j.top_cnj_alerts || []);
+          topCnjEl.innerHTML = items.length ? items.map(x=>{
+            const cnj = x.cnj || x[0] || "";
+            const n = (x.alertas !== undefined ? x.alertas : (x.count !== undefined ? x.count : (x[1]||0)));
+            return `<a class="chip me-1 mb-1 d-inline-flex" href="/ui/processo/${encodeURIComponent(cnj)}">${esc(cnj)}<span class="ms-2 badge text-bg-light">${n}</span></a>`;
+          }).join(" ") : `<span class="muted">Sem dados</span>`;
+        }
+        // Top Docs
+        const topDocsEl = document.getElementById("dash-top-docs");
+        if(topDocsEl){
+          const items = (j.top_docs_alerts || []);
+          topDocsEl.innerHTML = items.length ? items.map(x=>{
+            const doc = x.doc || x[0] || "";
+            const n = (x.alertas !== undefined ? x.alertas : (x.count !== undefined ? x.count : (x[1]||0)));
+            return `<a class="chip me-1 mb-1 d-inline-flex" href="/ui/watchlist#${encodeURIComponent(doc)}">${esc(doc)}<span class="ms-2 badge text-bg-light">${n}</span></a>`;
+          }).join(" ") : `<span class="muted">Sem dados</span>`;
+        }
+
+                // Operação
+        const ps = j.poll_state;
+        const ds = j.discover_state;
+        const ae = j.last_api_error;
+        const elP = document.getElementById('ops-poll'); if(elP) elP.textContent = _fmtOps(ps);
+        const elD = document.getElementById('ops-discover'); if(elD) elD.textContent = _fmtOps(ds);
+        const elA = document.getElementById('ops-apierr');
+        if(elA){
+          if(ae && ae.at){
+            elA.textContent = (ae.at.replace('T',' ').slice(0,19)) + ' • ' + (ae.method||'') + ' ' + (ae.path||'') + (ae.status?(' ('+ae.status+')'):'') ;
+          }else{
+            elA.textContent = '-';
+          }
+        }
+
+        // Série temporal
+        refreshSeries(doc);
+        // Painel de alertas
+        refreshAlerts(doc);
+
+        // Tabela por doc (sempre global)
+        const rows = document.getElementById("dash-doc-rows");
+        if(rows){
+          const summary = Array.isArray(j.docs_summary) ? j.docs_summary : [];
+          if(summary.length === 0){
+            rows.innerHTML = '<tr><td colspan="3" class="muted">Sem dados ainda. Adicione um CPF/CNPJ no Admin e descubra processos.</td></tr>';
+          }else{
+            rows.innerHTML = summary.map(x => `
+              <tr>
+                <td><code class="small">${esc(x.doc||"")}</code></td>
+                <td class="text-end">${esc(String(x.processos ?? 0))}</td>
+                <td class="text-end"><span class="badge rounded-pill ${Number(x.alertas||0)>0?'text-bg-danger':'text-bg-secondary'}">${esc(String(x.alertas ?? 0))}</span></td>
+              </tr>
+            `).join("");
+          }
+        }
+
+      }catch(e){
+        showInlineBanner("bn-dash","danger","Erro de rede ao carregar métricas", esc(e.toString()));
+      }
+    }
+
+    const btnR = document.getElementById("btn-dash-refresh");
+    if(btnR){ btnR.addEventListener("click", ()=>refreshDashboard(true)); }
+
+    const daysSel = document.getElementById('dash-days');
+    if(daysSel){ daysSel.addEventListener('change', ()=>{
+      const sel = document.getElementById('dash-scope');
+      const doc = (sel && sel.value && sel.value !== '__global__') ? sel.value : '';
+      refreshSeries(doc);
+    }); }
+
+
+// -----------------------------
+// Painel de alertas (auto-refresh, filtros, export CSV)
+// -----------------------------
+let alertsTimer = null;
+
+function _alertsRead(){
+  try{
+    const raw = localStorage.getItem("dash_alerts_cfg");
+    return raw ? JSON.parse(raw) : {};
+  }catch(e){ return {}; }
+}
+function _alertsWrite(cfg){
+  try{ localStorage.setItem("dash_alerts_cfg", JSON.stringify(cfg||{})); }catch(e){}
+}
+
+function _alertsCfgFromUI(){
+  const intervalEl = document.getElementById("alerts-interval");
+  const typesEl = document.getElementById("alerts-types");
+  const qEl = document.getElementById("alerts-q");
+  const vpEl = document.getElementById("alerts-must-vp");
+  return {
+    interval: intervalEl ? Number(intervalEl.value||0) : 0,
+    types: typesEl ? String(typesEl.value||"").trim() : "",
+    q: qEl ? String(qEl.value||"").trim() : "",
+    must_vp: vpEl ? !!vpEl.checked : false,
+  };
+}
+
+function _alertsApplyCfgToUI(cfg){
+  const intervalEl = document.getElementById("alerts-interval");
+  const typesEl = document.getElementById("alerts-types");
+  const qEl = document.getElementById("alerts-q");
+  const vpEl = document.getElementById("alerts-must-vp");
+  if(intervalEl && cfg.interval != null) intervalEl.value = String(cfg.interval);
+  if(typesEl && cfg.types != null) typesEl.value = String(cfg.types);
+  if(qEl && cfg.q != null) qEl.value = String(cfg.q);
+  if(vpEl && cfg.must_vp != null) vpEl.checked = !!cfg.must_vp;
+}
+
+function _alertsBuildUrl(doc){
+  const cfg = _alertsCfgFromUI();
+  const params = new URLSearchParams();
+  params.set("limit","50");
+  if(doc) params.set("doc", doc);
+  if(cfg.types) params.set("types", cfg.types);
+  if(cfg.q) params.set("q", cfg.q);
+  if(cfg.must_vp) params.set("must_value_penhora","1");
+  return "/ui/api/alerts?" + params.toString();
+}
+
+function _alertsBuildExportHref(doc){
+  const cfg = _alertsCfgFromUI();
+  const params = new URLSearchParams();
+  params.set("limit","500");
+  if(doc) params.set("doc", doc);
+  if(cfg.types) params.set("types", cfg.types);
+  if(cfg.q) params.set("q", cfg.q);
+  if(cfg.must_vp) params.set("must_value_penhora","1");
+  return "/ui/api/alerts/export.csv?" + params.toString();
+}
+
+async function refreshAlerts(doc){
+  try{
+    clearInlineBanner("bn-alerts");
+    const rows = document.getElementById("dash-alert-rows");
+    const exportBtn = document.getElementById("btnAlertsExport");
+    if(exportBtn) exportBtn.href = _alertsBuildExportHref(doc||"");
+    if(rows) rows.innerHTML = '<tr><td colspan="6" class="muted">Carregando...</td></tr>';
+
+    const url = _alertsBuildUrl(doc||"");
+    const r = await fetch(url);
+    const j = await r.json();
+    if(!j.ok){
+      showInlineBanner("bn-alerts","warning","Alertas indisponíveis", esc(j.error||j.message||"Falha"));
+      if(rows) rows.innerHTML = '<tr><td colspan="6" class="muted">Sem dados.</td></tr>';
+      return;
+    }
+
+    const items = Array.isArray(j.items) ? j.items : [];
+    if(!items.length){
+      if(rows) rows.innerHTML = '<tr><td colspan="6" class="muted">Sem alertas pendentes (com esses filtros).</td></tr>';
+      return;
+    }
+
+    function _when(it){
+      const d = it.data || it.created_at || "";
+      return d ? esc(String(d).replace('T',' ').slice(0,19)) : "-";
+    }
+    function _tipo(it){
+      const t = (it.tipo_inferido || it.tipo || "-");
+      return esc(String(t));
+    }
+    function _short(s, n){
+      const x = String(s||"");
+      return x.length > n ? (x.slice(0,n-1) + "…") : x;
+    }
+
+    if(rows){
+      rows.innerHTML = items.map(it => `
+        <tr>
+          <td class="mono small">${esc(String(it.event_id||""))}</td>
+          <td class="small">${_when(it)}</td>
+          <td class="mono small"><code>${esc(String(it.doc||""))}</code></td>
+          <td class="mono small"><a href="/ui/processo/${encodeURIComponent(String(it.cnj||""))}">${esc(String(it.cnj||""))}</a></td>
+          <td class="small"><span class="badge text-bg-light">${_tipo(it)}</span></td>
+          <td class="small wrap" title="${esc(String(it.texto||""))}">${esc(_short(it.texto, 220))}</td>
+        </tr>
+      `).join("");
+    }
+  }catch(e){
+    showInlineBanner("bn-alerts","warning","Falha ao carregar alertas", esc(e.message||String(e)));
+  }
+}
+
+function setupAlertsAutoRefresh(doc){
+  const cfg = _alertsCfgFromUI();
+  _alertsWrite(cfg);
+
+  if(alertsTimer){
+    clearInterval(alertsTimer);
+    alertsTimer = null;
+  }
+  const sec = Number(cfg.interval||0);
+  if(sec > 0){
+    alertsTimer = setInterval(()=>refreshAlerts(doc||""), Math.max(1, sec) * 1000);
+  }
+}
+
+// Inicializa filtros do painel de alertas
+(function initAlertsPanel(){
+  const sel = document.getElementById("dash-scope");
+  const currentDoc = (sel && sel.value && sel.value !== "__global__") ? sel.value : "";
+  const cfg = _alertsRead();
+  if(cfg && Object.keys(cfg).length){
+    _alertsApplyCfgToUI(cfg);
+  }else{
+    // defaults
+    _alertsApplyCfgToUI({interval: 10, types: "SENTENCA,DECISAO", q: "", must_vp: false});
+  }
+
+  const btn = document.getElementById("btnAlertsRefresh");
+  if(btn) btn.addEventListener("click", ()=>refreshAlerts(currentDoc));
+
+  const intervalEl = document.getElementById("alerts-interval");
+  const typesEl = document.getElementById("alerts-types");
+  const qEl = document.getElementById("alerts-q");
+  const vpEl = document.getElementById("alerts-must-vp");
+  const onChange = ()=>{
+    const sel2 = document.getElementById("dash-scope");
+    const doc2 = (sel2 && sel2.value && sel2.value !== "__global__") ? sel2.value : "";
+    refreshAlerts(doc2);
+    setupAlertsAutoRefresh(doc2);
+  };
+  if(intervalEl) intervalEl.addEventListener("change", onChange);
+  if(typesEl) typesEl.addEventListener("change", onChange);
+  if(qEl) qEl.addEventListener("change", onChange);
+  if(vpEl) vpEl.addEventListener("change", onChange);
+})();
+
+refreshDashboard();
+setInterval(()=>refreshDashboard(false), 5000);
+
+</script>
+
+<div class="row g-3">
+      <div class="col-lg-5">
+        <div class="card p-4">
+          <h5 class="mb-1">Adicionar CPF/CNPJ</h5>
+          <div class="muted mb-3">Cria monitoramento de <b>novos processos</b> no Escavador e salva localmente.</div>
+
+          <form id="frmAdd" class="row g-2">
+            <div class="col-12">
+              <input name="doc" class="form-control form-control-lg mono" placeholder="08.840.686/0001-30 ou 123.456.789-00" required>
+            </div>
+            <div class="col-12 d-grid">
+              <button class="btn btn-brand btn-lg">Adicionar</button>
+            </div>
+          </form>
+
+          <div id="addResult" class="mt-3"></div>
+
+          <hr class="divider">
+
+          <div class="muted small">
+            Para abrir um processo direto: <span class="mono">/ui/processo/SEU_CNJ</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="col-lg-7">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div>
+            <h5 class="mb-0">Watchlist</h5>
+            <div class="muted small">Adicionar, ver, remover</div>
+          </div>
+        </div>
+
+        <div class="row g-3">""" + cards + """</div>
+      </div>
+    </div>
+
+<script>
+function esc(s){ return (s||"").toString().replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"); }
+
+document.getElementById("frmAdd").addEventListener("submit", async function(ev){
+  ev.preventDefault();
+  var doc = ev.target.doc.value.trim();
+  var box = document.getElementById("addResult");
+  box.innerHTML = '<div class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Enviando…</div>';
+  try{
+    var r = await fetch("/watchlist", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ doc: doc }) });
+    var j = await r.json();
+    if(j.ok){
+      box.innerHTML = '<div class="alert alert-success mb-0"><b>OK!</b> Doc cadastrado. Recarregando…</div>';
+      setTimeout(function(){ location.reload(); }, 800);
+    } else {
+      box.innerHTML = '<div class="alert alert-warning mb-0"><b>Falhou:</b> ' + esc(j.message || j.error || "erro") + '</div>';
+    }
+  } catch(e){
+    var _e = esc(e.toString());
+    showInlineBanner("bn-movs","danger","Erro ao carregar movimentações", _e);
+    box.innerHTML = '<div class="muted">Sem movimentações para exibir.</div>';
+  }
+});
+
+async function deleteDoc(id, doc){
+  if(!confirm("Remover da watchlist?\\n" + doc)) return;
+  var r = await fetch("/watchlist/" + id, { method:"DELETE" });
+  var j = await r.json();
+  if(j.ok) location.reload();
+  else showToast("danger","Falhou",(j.error || j.message || "erro"));
+}
+</script>
+    """
+    return render_template_string(UI_BASE, body=body)
+
+
+# ---------------- UI: processo "produto" (Sidebar + Abas) ----------------
+@app.get("/ui/processo/<path:cnj>")
+def ui_processo(cnj: str):
+    if not CNJ_REGEX.fullmatch(cnj):
+        return render_template_string(UI_BASE, body=ui_alert("danger", "CNJ inválido", "Use o formato 0000000-00.0000.0.00.0000."))
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT doc, tipo_doc FROM watchlist ORDER BY id DESC LIMIT 500")
+    wl = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    opts = "<option value=''>Selecionar doc</option>"
+    for it in wl:
+        opts += "<option value='" + it["doc"] + "'>" + it["tipo_doc"] + ": " + it["doc"] + "</option>"
+
+    cnj_json = json.dumps(cnj)
+
+    body = """
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <div>
+        <div class="muted small">Manutenção do processo</div>
+        <div class="h4 mb-0 mono">__CNJ__</div>
+      </div>
+      <div class="d-flex gap-2 flex-wrap justify-content-end">
+        <a class="btn btn-outline-primary" href="/ui">Dashboard</a>
+        <button class="btn btn-brand" id="btn-sync">Sync agora</button>
+      </div>
+    </div>
+
+    <div class="row g-3">
+      <!-- Sidebar -->
+      <div class="col-lg-4">
+        <div class="sticky-side">
+          <div class="side-card p-3 mb-3" id="side-summary">
+            <div id="bn-summary" class="inline-banner"></div>
+            <div id="side-summary-content" class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando resumo…</div>
+          </div>
+
+          <div class="side-card p-3 mb-3">
+            <div class="side-title mb-1">Filtros rápidos</div>
+            <div class="muted small mb-2">Clique em um tipo para filtrar a timeline.</div>
+
+            <div class="d-flex flex-wrap gap-2" id="quick-chips">
+              <span class="chip chip-click" data-t="SENTENCA">⚖️ SENTENCA</span>
+              <span class="chip chip-click" data-t="DECISAO">🧑‍⚖️ DECISAO</span>
+              <span class="chip chip-click" data-t="INTIMACAO">📣 INTIMACAO</span>
+              <span class="chip chip-click" data-t="CITACAO">📨 CITACAO</span>
+              <span class="chip chip-click" data-t="AUDIENCIA">🗓️ AUDIENCIA</span>
+              <span class="chip chip-click" data-t="DESPACHO">📝 DESPACHO</span>
+              <span class="chip chip-click" data-t="JUNTADA">📎 JUNTADA</span>
+              <span class="chip chip-click" data-t="DISTRIBUICAO">🧭 DISTRIBUICAO</span>
+              <span class="chip chip-click" data-t="TRANSITO">🏁 TRANSITO</span>
+              <span class="chip chip-click" data-t="">🧽 LIMPAR</span>
+            </div>
+
+            <hr class="divider">
+
+            <div class="muted small mb-1">Busca livre:</div>
+            <input class="form-control" id="q_side" placeholder="Ex: liminar, valor, petição">
+            <div class="d-grid mt-2">
+              <button class="btn btn-outline-primary" id="btn-side-search">Buscar</button>
+            </div>
+          </div>
+
+          <div class="side-card p-3">
+            <div class="side-title mb-1">Vincular doc (CRUD)</div>
+            <div class="muted small">Vincula este CNJ a CPF/CNPJ para agregação e navegação.</div>
+
+            <div class="mt-2">
+              <label class="form-label muted small">Escolher da watchlist</label>
+              <select class="form-select mono" id="docSelect">__OPTS__</select>
+            </div>
+
+            <div class="mt-2">
+              <label class="form-label muted small">Ou digitar</label>
+              <input class="form-control mono" id="docManual" placeholder="08.840.686/0001-30 ou 123.456.789-00">
+            </div>
+
+            <div class="d-grid mt-2">
+              <button class="btn btn-brand" id="btnLinkDoc">Vincular</button>
+            </div>
+
+            <div class="mt-2">
+              <span class="muted small" id="link-status"></span>
+            </div>
+
+            <hr class="divider">
+
+            <div class="muted small mb-1">Docs vinculados:</div>
+            <div id="bn-linked" class="inline-banner"></div>
+            <div id="linkedDocs" class="muted small">Carregando…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Main -->
+      <div class="col-lg-8">
+        <ul class="nav nav-tabs mb-3" role="tablist">
+          <li class="nav-item" role="presentation">
+            <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#pane-capa" type="button" role="tab">Capa</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-partes" type="button" role="tab">Partes</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-pedmult" type="button" role="tab">Pedidos &amp; Multas</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-movs" type="button" role="tab">Movimentações</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-docs" type="button" role="tab">Documentos</button>
+          </li>
+        </ul>
+
+        <div class="tab-content">
+          <div class="tab-pane fade show active" id="pane-capa" role="tabpanel">
+            <div id="bn-capa" class="inline-banner mb-2"></div>
+            <div class="card p-3" id="capa-box"><span class="muted">Carregando capa…</span></div>
+          </div>
+
+          <div class="tab-pane fade" id="pane-partes" role="tabpanel">
+            <div id="bn-partes" class="inline-banner mb-2"></div>
+            <div class="card p-3" id="partes-box"><span class="muted">Carregando partes…</span></div>
+          </div>
+
+          <div class="tab-pane fade" id="pane-pedmult" role="tabpanel">
+            <div id="bn-pedmult" class="inline-banner mb-2"></div>
+
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <div class="muted small">Extraído da capa (quando disponível) e apresentado de forma consolidada.</div>
+              <button class="btn btn-outline-primary btn-mini" id="btn-pedmult-refresh">Recarregar</button>
+            </div>
+
+            <div id="valor-causa-box"></div>
+            <div id="peticao-box"></div>
+
+            <div class="row g-2">
+              <div class="col-lg-6">
+                <div class="card p-3" id="pedidos-box"><span class="muted">Carregando pedidos…</span></div>
+              </div>
+              <div class="col-lg-6">
+                <div class="card p-3" id="multas-box"><span class="muted">Carregando multas…</span></div>
+              </div>
+            </div>
+
+            <div id="valores-movs-box" class="mt-2"></div>
+          </div>
+
+          <div class="tab-pane fade" id="pane-movs" role="tabpanel">
+            <div id="bn-movs" class="inline-banner mb-2"></div>
+            <div class="card p-3 mb-2">
+              <div class="row g-2 align-items-end">
+                <div class="col-md-6">
+                  <label class="form-label muted small">Buscar texto</label>
+                  <input class="form-control" id="q" placeholder="Ex: sentença, citação, audiência">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label muted small">Tipo</label>
+                  <input class="form-control mono" id="tipo" placeholder="Ex: INTIMACAO">
+                </div>
+                <div class="col-md-3 d-grid">
+                  <button class="btn btn-outline-primary" id="btn-filtrar">Filtrar</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="card p-3" id="movs-box"><span class="muted">Carregando timeline…</span></div>
+
+            <div class="d-flex justify-content-between align-items-center mt-2">
+              <button class="btn btn-outline-primary btn-mini" id="prev">Anterior</button>
+              <span class="muted small" id="pageinfo"></span>
+              <button class="btn btn-outline-primary btn-mini" id="next">Próxima</button>
+            </div>
+          </div>
+
+          <div class="tab-pane fade" id="pane-docs" role="tabpanel">
+            <div id="bn-docs" class="inline-banner mb-2"></div>
+            <div class="card p-3">
+              <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
+                <div class="side-title mb-0">Documentos</div>
+                <div class="d-flex gap-2 flex-wrap">
+                  <div class="btn-group" role="group" aria-label="tipo docs">
+                    <input type="radio" class="btn-check" name="docsTipo" id="docsTipoPub" autocomplete="off" checked>
+                    <label class="btn btn-outline-secondary btn-sm" for="docsTipoPub">Públicos</label>
+
+                    <input type="radio" class="btn-check" name="docsTipo" id="docsTipoAutos" autocomplete="off">
+                    <label class="btn btn-outline-secondary btn-sm" for="docsTipoAutos">Autos</label>
+                  </div>
+                  <button class="btn btn-outline-primary btn-sm" id="btn-docs-refresh">Recarregar</button>
+                  <button class="btn btn-brand btn-sm" id="btn-docs-update">Atualizar no tribunal</button>
+                </div>
+              </div>
+
+              <div class="muted small mb-2">
+                Público: baixa documentos públicos. Autos: exige autenticação/certificado na conta do Escavador.
+              </div>
+
+              <div id="autos-creds-panel" class="card p-2 mb-2 border-secondary" style="display:none;">
+                <div class="muted small mb-2 fw-semibold">Credenciais para Autos (obrigatório)</div>
+                <div class="row g-2">
+                  <div class="col-sm-4">
+                    <label class="form-label small muted" for="autosUsuario">Usuário Escavador</label>
+                    <input id="autosUsuario" type="text" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="usuário">
+                  </div>
+                  <div class="col-sm-4">
+                    <label class="form-label small muted" for="autosSenha">Senha Escavador</label>
+                    <input id="autosSenha" type="password" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="senha">
+                  </div>
+                  <div class="col-sm-4">
+                    <label class="form-label small muted" for="autosCertId">ID do Certificado (opcional)</label>
+                    <input id="autosCertId" type="number" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="ex: 123">
+                  </div>
+                </div>
+              </div>
+
+              <div id="docs-box"><span class="muted">Selecione e carregue…</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+<script>
+var CNJ = __CNJ_JSON__;
+var limit = 25;
+var offset = 0;
+var q = "";
+var tipo = "";
+var capaData = null;
+
+function esc(s){
+  return (s||"").toString().replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+}
+
+// Converte valores vindos da API (que às vezes são objetos) em texto amigável
+function safeText(v){
+  if(v === null || v === undefined) return "";
+  if(typeof v === "number") return String(v);
+  if(typeof v === "string"){
+    const s = v.trim();
+    if((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))){
+      try{ return safeText(JSON.parse(s)); }catch(e){}
+    }
+    return v;
+  }
+  if(typeof v === "boolean") return v ? "Sim" : "Não";
+  if(Array.isArray(v)) return v.map(safeText).filter(Boolean).join(", ");
+  if(typeof v === "object"){
+    // casos comuns de objetos retornados pela API
+    if(v.valor_formatado) return String(v.valor_formatado);
+    if(v.valor !== undefined && (typeof v.valor === "number" || typeof v.valor === "string")) return String(v.valor);
+    if(v.nome) return String(v.nome);
+    if(v.descricao) return String(v.descricao);
+    if(v.sigla) return String(v.sigla);
+
+    // unidade_origem costuma vir com cidade/estado/tribunal_sigla
+    var cidade = v.cidade || "";
+    var estado = "";
+    try{
+      if(v.estado){
+        if(typeof v.estado === "string") estado = v.estado;
+        else if(v.estado.sigla) estado = v.estado.sigla;
+        else if(v.estado.nome) estado = v.estado.nome;
+      }
+    }catch(e){}
+    var trib = v.tribunal_sigla || v.tribunal || "";
+    var parts = [];
+    var a = [cidade, estado].filter(Boolean).join(" - ");
+    if(a) parts.push(a);
+    if(trib) parts.push(String(trib));
+    if(parts.length) return parts.join(" • ");
+
+    // fallback: JSON curto para não estourar layout
+    try{
+      var s = JSON.stringify(v);
+      if(s.length > 80) s = s.slice(0, 77) + "...";
+      return s;
+    }catch(e){
+      return "[obj]";
+    }
+  }
+  return String(v);
+}
+
+function formatDateBR(dt){
+  if(!dt) return "";
+  try{
+    var d = new Date(dt);
+    if(isNaN(d.getTime())) return String(dt);
+    // formato compacto pt-BR sem vírgula
+    var s = d.toLocaleString("pt-BR", { year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit" });
+    return s.replace(",", "");
+  } catch(e){
+    return String(dt);
+  }
+}
+
+function formatMoneyBR(v){
+  if(v === null || v === undefined || v === "") return "";
+  if(typeof v === "object"){
+    // tenta extrair de estruturas comuns
+    if(v.valor_formatado) return safeText(v.valor_formatado);
+    if(v.valor !== undefined) v = v.valor;
+  }
+  var s = safeText(v).trim();
+  // já vem formatado?
+  if(/^R[$]/.test(s) || /^[0-9]{1,3}([.][0-9]{3})*,[0-9]{2}$/.test(s)) return s;
+  // tenta número
+  var n = Number(String(s).replace(/[.]/g, "").replace(",", "."));
+  if(!isFinite(n)) return s;
+  try{
+    return n.toLocaleString("pt-BR", { style:"currency", currency:"BRL" });
+  }catch(e){
+    return "R$ " + n.toFixed(2);
+  }
+}
+function chip(label, value){
+  var txt = safeText(value);
+  if(!txt) return "";
+  return '<span class="chip"><b>' + esc(label) + ':</b> <span class="chip-val truncate">' + esc(txt) + '</span></span>';
+}
+function kpi(label, value, action){
+  var txt = safeText(value);
+  var act = action ? String(action) : "";
+  var cls = act ? "kpi kpi-click" : "kpi";
+  var attrs = act ? (' role="button" tabindex="0" data-action="' + esc(act) + '"') : "";
+  var wrap = (txt && txt.length > 12) ? ' wrap' : '';
+  return '<div class="col-6 col-lg-3"><div class="' + cls + '"' + attrs + '><div class="label">' + esc(label) + '</div><div class="value' + wrap + '">' + esc(txt || "") + '</div></div></div>';
+}
+function activateTab(target){
+  try{
+    var btn = document.querySelector('button[data-bs-target="' + target + '"]');
+    if(btn) btn.click();
+  }catch(e){}
+}
+function scrollToEl(id){
+  try{
+    var el = document.getElementById(id);
+    if(el) el.scrollIntoView({ behavior:"smooth", block:"start" });
+  }catch(e){}
+}
+function bindKpiClicks(summary, fontes){
+  var host = document.getElementById("side-summary-content");
+  if(!host) return;
+  host.querySelectorAll(".kpi[data-action]").forEach(function(el){
+    if(el.__bound) return;
+    el.__bound = true;
+    function run(){
+      var a = el.getAttribute("data-action") || "";
+      if(a === "movs"){
+        activateTab("#pane-movs");
+        setTimeout(function(){ scrollToEl("movs-box"); }, 60);
+      } else if(a === "ultima"){
+        activateTab("#pane-movs");
+        setTimeout(function(){ scrollToEl("movs-box"); }, 60);
+      } else if(a === "fontes"){
+        activateTab("#pane-capa");
+        setTimeout(function(){ scrollToEl("capa-box"); }, 60);
+        try{ showToast("info", "Fontes", (fontes && fontes.length ? (fontes.length + " fonte(s) na capa") : "Sem fontes") , 2200); }catch(e){}
+      } else if(a === "verificado"){
+        try{
+          var v = summary && summary.data_ultima_verificacao ? formatDateBR(summary.data_ultima_verificacao) : "";
+          showToast("info", "Verificado", v ? ("Última verificação: " + v) : "Sem data de verificação", 3000);
+        }catch(e){}
+      }
+    }
+    el.addEventListener("click", run);
+    el.addEventListener("keydown", function(ev){ if(ev.key==="Enter"||ev.key===" "){ ev.preventDefault(); run(); }});
+  });
+}
+
+function readComplement(capa, tipo){
+  var arr = (capa && capa.informacoes_complementares) ? capa.informacoes_complementares : [];
+  var hit = arr.find(function(x){ return (x.tipo||"").toString().toLowerCase() === tipo.toLowerCase(); });
+  return hit ? hit.valor : null;
+}
+function safeDateStr(s){
+  if(!s) return "";
+  var m = ("" + s).match(/^(\\d{4}-\\d{2}-\\d{2})/);
+  return m ? m[1] : "";
+}
+function fmtDt(v){
+  if(!v) return "-";
+  var m = String(v).match(/^(\\d{4})-(\\d{2})-(\\d{2})/);
+  if(m) return m[3] + "/" + m[2] + "/" + m[1];
+  return String(v).replace("T"," ").slice(0,19);
+}
+function todayStrLocal(){
+  var d = new Date();
+  var y = d.getFullYear();
+  var m = String(d.getMonth()+1).padStart(2,"0");
+  var dd = String(d.getDate()).padStart(2,"0");
+  return y + "-" + m + "-" + dd;
+}
+
+function iconForType(t){
+  var x = (t||"").toUpperCase();
+  if(x.indexOf("SENTEN")>=0) return "⚖️";
+  if(x.indexOf("DECIS")>=0) return "🧑‍⚖️";
+  if(x.indexOf("INTIM")>=0) return "📣";
+  if(x.indexOf("CIT")>=0) return "📨";
+  if(x.indexOf("AUDI")>=0) return "🗓️";
+  if(x.indexOf("DESP")>=0) return "📝";
+  if(x.indexOf("JUNT")>=0) return "📎";
+  if(x.indexOf("DISTR")>=0) return "🧭";
+  if(x.indexOf("TRANS")>=0) return "🏁";
+  return "📄";
+}
+
+function renderPessoa(p){
+  var nome = p.nome || "";
+  var doc = p.cnpj || p.cpf || "";
+  var tipoN = p.tipo_normalizado || p.tipo || "";
+  var advs = Array.isArray(p.advogados) ? p.advogados : [];
+  var advHtml = "";
+  if(advs.length > 0){
+    advHtml = "<div class='mt-2 muted small'><b>Advogados:</b><ul class='mb-0'>";
+    for(var i=0;i<advs.length;i++){
+      var a = advs[i];
+      var oabs = Array.isArray(a.oabs) ? a.oabs : [];
+      var oabStr = oabs.map(function(o){ return (o.uf||"") + (o.numero||""); }).join(", ");
+      advHtml += "<li>" + esc(a.nome || "") + " <span class='mono'>(" + esc(oabStr) + ")</span></li>";
+    }
+    advHtml += "</ul></div>";
+  }
+  return (
+    "<div class='p-2' style='border:1px solid var(--border); border-radius:14px; background:rgba(48,80,160,.03);'>" +
+      "<div class='d-flex justify-content-between align-items-start gap-2'>" +
+        "<div>" +
+          "<div style='font-weight:750;'>" + esc(nome) + "</div>" +
+          "<div class='muted small'>" + esc(tipoN) + (doc ? " • " + esc(doc) : "") + "</div>" +
+        "</div>" +
+        "<span class='badge-soft p-2'>" + esc((p.polo||"").toString().toUpperCase()||"") + "</span>" +
+      "</div>" +
+      advHtml +
+    "</div>"
+  );
+}
+
+function renderEnvolvidos(envolvidos){
+  var arr = Array.isArray(envolvidos) ? envolvidos : [];
+  if(arr.length===0) return "<div class='muted'>Sem envolvidos nesta fonte.</div>";
+
+  var ativos = [], passivos = [], outros = [];
+  for(var i=0;i<arr.length;i++){
+    var p = arr[i];
+    var polo = (p.polo||"").toString().toUpperCase();
+    if(polo==="ATIVO") ativos.push(p);
+    else if(polo==="PASSIVO") passivos.push(p);
+    else outros.push(p);
+  }
+
+  function section(title, items){
+    if(!items || items.length===0) return "";
+    var html = "<div class='mt-3'><div class='h6 mb-2'>" + esc(title) + "</div><div class='d-grid gap-2'>";
+    for(var j=0;j<items.length;j++) html += renderPessoa(items[j]);
+    html += "</div></div>";
+    return html;
+  }
+
+  return section("Polo Ativo", ativos) + section("Polo Passivo", passivos) + section("Outros", outros);
+}
+
+function aggregatePartes(fontes){
+  var map = {};
+  for(var i=0;i<fontes.length;i++){
+    var f = fontes[i] || {};
+    var env = Array.isArray(f.envolvidos) ? f.envolvidos : [];
+    for(var j=0;j<env.length;j++){
+      var p = env[j] || {};
+      var key = (p.nome||"") + "|" + (p.cpf||p.cnpj||"") + "|" + (p.tipo_normalizado||p.tipo||"") + "|" + (p.polo||"");
+      if(!map[key]) map[key] = p;
+    }
+  }
+  return Object.keys(map).map(function(k){ return map[k]; });
+}
+
+async function loadCapaPalatavel(){
+  clearInlineBanner("bn-summary");
+  clearInlineBanner("bn-capa");
+  clearInlineBanner("bn-partes");
+
+  var side = document.getElementById("side-summary-content");
+  var capaBox = document.getElementById("capa-box");
+  var partesBox = document.getElementById("partes-box");
+
+  side.innerHTML = '<div class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando resumo…</div>';
+  capaBox.innerHTML = '<div class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando…</div>';
+  partesBox.innerHTML = '<div class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando…</div>';
+
+  var r = null;
+  var j = null;
+  try{
+    r = await fetch("/ui/api/processo/" + encodeURIComponent(CNJ) + "/capa");
+    try { j = await r.json(); } catch(_e){ j = { ok:false, error:"RESPOSTA_INVALIDA", message:"Resposta não-JSON do servidor." }; }
+  } catch(e){
+    showInlineBanner("bn-capa","danger","Falha ao consultar capa", esc(e.toString()));
+    showInlineBanner("bn-summary","danger","Falha ao carregar", esc(e.toString()));
+    side.innerHTML = '<div class="muted">Sem resumo disponível.</div>';
+    capaBox.innerHTML = '<div class="muted">Sem capa disponível.</div>';
+    partesBox.innerHTML = '<div class="muted">Sem partes disponíveis.</div>';
+    return;
+  }
+
+  if(!j.ok){
+    var msg = esc(j.message || j.error || ("HTTP " + (r ? r.status : "")) || "erro");
+    showInlineBanner("bn-summary","warning","Capa indisponível", msg);
+    showInlineBanner("bn-capa","warning","Capa indisponível", msg);
+    showInlineBanner("bn-partes","warning","Partes indisponíveis", msg);
+    side.innerHTML = '<div class="muted">Sem resumo disponível.</div>';
+    capaBox.innerHTML = '<div class="muted">Sem capa disponível.</div>';
+    partesBox.innerHTML = '<div class="muted">Sem partes disponíveis.</div>';
+    return;
+  }
+
+  capaData = j.data || {};
+  // A API pode devolver {data:{...}} ou direto {...}. Vamos aceitar ambos.
+  var d = (capaData && (capaData.data || capaData)) || {};
+  // 'fontes' pode estar em d.fontes ou capaData.fontes dependendo do formato.
+  var fontes = [];
+  if(Array.isArray(d.fontes)) fontes = d.fontes;
+  else if(Array.isArray(capaData.fontes)) fontes = capaData.fontes;
+
+  // Sidebar summary
+  var resumoHtml = ""
+    + "<div class='d-flex justify-content-between align-items-start gap-2'>"
+    + "  <div>"
+    + "    <div class='muted small'>Resumo</div>"
+    + "    <div class='side-title mono'>" + esc(d.numero_cnj || CNJ) + "</div>"
+    + "  </div>"
+    + "  <div id='badge-hoje'></div>"
+    + "</div>"
+    + "<div class='d-flex flex-wrap gap-2 mt-2'>"
+    + chip("Ativo", d.titulo_polo_ativo)
+    + chip("Passivo", d.titulo_polo_passivo)
+    + chip("Unidade", d.unidade_origem)
+    + chip("UF", d.estado_origem)
+    + "</div>"
+    + "<hr class='divider'>"
+    + "<div class='row g-2'>"
+    + kpi("Movs", d.quantidade_movimentacoes || "", "movs")
+    + kpi("Última mov", formatDateBR(d.data_ultima_movimentacao || ""), "ultima")
+    + kpi("Verificado", formatDateBR(d.data_ultima_verificacao || ""), "verificado")
+    + kpi("Fontes", fontes.length, "fontes")
+    + "</div>"
+    + "<div class='muted small mt-2'>Dica: use os chips de tipo para focar a timeline.</div>";
+
+  side.innerHTML = resumoHtml;
+
+bindKpiClicks(d, fontes);
+
+  // Partes agregadas
+  if(fontes.length>0){
+    var all = aggregatePartes(fontes);
+    partesBox.innerHTML = "<div class='muted small mb-2'>Agregado de todas as fontes (deduplicado)</div>" + renderEnvolvidos(all);
+  } else {
+    partesBox.innerHTML = "<div class='muted'>Sem fontes retornadas.</div>" + "<div class='mt-2 small muted'>Dica: abra o Network e veja a resposta de <code>/ui/api/processo/&lt;cnj&gt;/capa</code>.</div>";
+  }
+
+  // Abas por fonte na Capa
+  if(fontes.length === 0){
+    capaBox.innerHTML = "<div class='muted'>Sem fontes retornadas.</div>" + "<details class='mt-2'><summary class='small'>Ver payload (debug)</summary><pre class='small'>" + esc(JSON.stringify(capaData, null, 2)) + "</pre></details>";
+    return;
+  }
+
+  var tabs = [];
+  for(var i=0;i<fontes.length;i++){
+    var f = fontes[i];
+    var grau = f.grau_formatado || (f.grau ? ("" + f.grau + "º grau") : "");
+    var tipoF = (f.tipo || "").toString().toUpperCase();
+    var label = f.descricao || f.nome || grau || tipoF || "Fonte";
+    if(label.toLowerCase().includes("diário de justiça")) label = "Diário (DJ)";
+    if(grau) label = label + " • " + grau;
+    tabs.push({ idx:i, id:"fonte-" + i, label:label });
+  }
+
+  var nav = "<ul class='nav nav-pills mb-3 gap-2' role='tablist'>";
+  for(var t=0;t<tabs.length;t++){
+    var it = tabs[t];
+    nav += "<li class='nav-item' role='presentation'>"
+        +  "<button class='nav-link " + (t===0 ? "active" : "") + "' data-bs-toggle='tab' data-bs-target='#" + it.id + "' type='button' role='tab'>"
+        +    esc(it.label)
+        +  "</button>"
+        + "</li>";
+  }
+  nav += "</ul>";
+
+  var panes = "<div class='tab-content'>";
+  for(var p=0;p<tabs.length;p++){
+    var tab = tabs[p];
+    var ff = fontes[tab.idx] || {};
+    var c = ff.capa || {};
+    var isDiario = (ff.tipo || "").toString().toUpperCase().includes("DIARIO");
+    var juiz = readComplement(c, "Juiz") || readComplement(c, "Relator") || "";
+    var chips = "<div class='d-flex flex-wrap gap-2 mb-3'>"
+      + chip("Tribunal", ff.sigla || (ff.tribunal && ff.tribunal.sigla) || "")
+      + chip("Sistema", ff.sistema || "")
+      + chip("Status", ff.status_predito || "")
+      + chip("Segredo", ff.segredo_justica ? "Sim" : "Não")
+      + chip("Físico", ff.fisico ? "Sim" : "Não")
+      + chip("Qtd movs", ff.quantidade_movimentacoes || "")
+      + "</div>";
+
+    panes += "<div class='tab-pane fade " + (p===0 ? "show active" : "") + "' id='" + tab.id + "' role='tabpanel'>";
+
+    if(isDiario){
+      panes += chips
+        + "<div class='row g-2'>"
+        + kpi("Tipo", ff.tipo || "DIARIO")
+        + kpi("Descrição", ff.descricao || "")
+        + kpi("Última mov", formatDateBR(ff.data_ultima_movimentacao || ""))
+        + kpi("Verificação", formatDateBR(ff.data_ultima_verificacao || ""))
+        + "</div>";
+      panes += "<details class='mt-3'><summary class='muted'>Ver JSON da fonte</summary><pre class='mono wrap mt-2 mb-0'>"
+        + esc(JSON.stringify(ff, null, 2)) + "</pre></details>";
+      panes += "</div>";
+      continue;
+    }
+
+    panes += chips
+      + "<div class='row g-2'>"
+      + kpi("Classe", c.classe || "")
+      + kpi("Assunto", c.assunto || "")
+      + kpi("Área", c.area || "")
+      + kpi("Órgão julgador", c.orgao_julgador || "")
+      + kpi("Distribuição", formatDateBR(c.data_distribuicao || ""))
+      + kpi("Situação", c.situacao || "")
+      + kpi("Valor causa", formatMoneyBR(c.valor_causa || ""))
+      + kpi("Juiz/Relator", juiz || "")
+      + "</div>"
+      + "<hr class='divider'>"
+      + "<div class='h6 mb-2'>Envolvidos (desta fonte)</div>"
+      + renderEnvolvidos(ff.envolvidos);
+
+    panes += "<details class='mt-3'><summary class='muted'>Ver JSON da capa</summary><pre class='mono wrap mt-2 mb-0'>"
+      + esc(JSON.stringify(c, null, 2)) + "</pre></details>";
+
+    panes += "<details class='mt-3'><summary class='muted'>Ver JSON da fonte</summary><pre class='mono wrap mt-2 mb-0'>"
+      + esc(JSON.stringify(ff, null, 2)) + "</pre></details>";
+
+    panes += "</div>";
+  }
+  panes += "</div>";
+
+  capaBox.innerHTML = nav + panes + "<details class='mt-3'><summary class='muted'>Ver JSON completo (processo)</summary><pre class='mono wrap mt-2 mb-0'>"
+    + esc(JSON.stringify(capaData, null, 2)) + "</pre></details>";
+}
+
+function renderTimeline(items){
+  if(!items || items.length===0) return "<div class='muted'>Sem movimentações neste recorte.</div>";
+
+  var today = todayStrLocal();
+  var anyToday = false;
+
+  // agrupa por dia (YYYY-MM-DD)
+  var groups = {};
+  for(var i=0;i<items.length;i++){
+    var it = items[i];
+    var dt = safeDateStr(it.data || it.created_at || "");
+    if(!dt) dt = "Sem data";
+    if(!groups[dt]) groups[dt] = [];
+    groups[dt].push(it);
+    if(dt === today) anyToday = true;
+  }
+
+  // ordena dias: itens já vêm em DESC, mas garantimos
+  var days = Object.keys(groups).sort(function(a,b){
+    if(a==="Sem data") return 1;
+    if(b==="Sem data") return -1;
+    return (a<b) ? 1 : (a>b) ? -1 : 0;
+  });
+
+  var html = "";
+  for(var d=0; d<days.length; d++){
+    var day = days[d];
+    var label = day;
+    var badge = (day === today) ? "<span class='badge-today'>mudou hoje</span>" : "";
+    html += "<div class='timeline-day'><div class='mono'><b>" + esc(label) + "</b></div>" + badge + "</div>";
+    var arr = groups[day] || [];
+
+    for(var j=0;j<arr.length;j++){
+      var it = arr[j];
+      var t = (it.tipo || it.tipo_inferido || "SEM_TIPO").toString().toUpperCase();
+      var icon = iconForType(t);
+      var meta = (it.data || it.created_at || "");
+      var texto = it.texto || "";
+
+      var newBadge = (safeDateStr(meta) === today) ? "<span class='badge-new'>novo</span>" : "";
+
+      html += ""
+        + "<div class='tl-item mt-2'>"
+        + "  <div class='tl-top'>"
+        + "    <div class='d-flex gap-2'>"
+        + "      <div class='tl-icon'>" + esc(icon) + "</div>"
+        + "      <div>"
+        + "        <div class='tl-title'>" + esc(t) + " " + newBadge + "</div>"
+        + "        <div class='tl-meta mono'>" + esc(meta) + "</div>"
+        + "      </div>"
+        + "    </div>"
+        + "  </div>"
+        + "  <div class='wrap'>" + esc(texto) + "</div>"
+        + "</div>";
+    }
+  }
+
+  // Atualiza badge no sidebar (mudou hoje)
+  var badgeBox = document.getElementById("badge-hoje");
+  if(badgeBox){
+    badgeBox.innerHTML = anyToday ? "<span class='badge-today'>mudou hoje</span>" : "<span class='badge-soft p-2'>sem mudanças hoje</span>";
+  }
+  return html;
+}
+
+async function loadMovs(){
+  clearInlineBanner("bn-movs");
+  var box = document.getElementById("movs-box");
+  box.innerHTML = '<span class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando…</span>';
+
+  try{
+  var url = "";
+  if(q || tipo){
+    url = "/processos/" + encodeURIComponent(CNJ) + "/movimentacoes/busca?q=" + encodeURIComponent(q) + "&tipo=" + encodeURIComponent(tipo) + "&limit=" + limit + "&offset=" + offset;
+  } else {
+    url = "/processos/" + encodeURIComponent(CNJ) + "/movimentacoes?limit=" + limit + "&offset=" + offset;
+  }
+
+  var r = await fetch(url);
+  var j = await r.json();
+  if(!j.ok){
+    var _m = esc(j.message || j.error || "erro");
+    showInlineBanner("bn-movs","warning","Falha ao carregar movimentações", _m);
+    box.innerHTML = '<div class="muted">Sem movimentações para exibir.</div>';
+    return;
+  }
+
+  var items = j.items || [];
+  var total = (j.total === undefined || j.total === null) ? 0 : j.total;
+
+  box.innerHTML = renderTimeline(items);
+
+  var end = offset + items.length;
+  document.getElementById("pageinfo").textContent = items.length ? ("Mostrando " + (offset+1) + "–" + end + " (total aprox: " + total + ")") : ("offset=" + offset);
+  } catch(e){
+    box.innerHTML = '<div class="alert alert-danger mb-0"><b>Erro:</b> ' + esc(e.toString()) + '</div>';
+  }
+}
+
+
+// ----------------------------
+// Pedidos & Multas (extraído da capa)
+// ----------------------------
+var pedmultLoadedOnce = false;
+
+function objToPairs(o){
+  if(!o || typeof o !== "object") return [];
+  var keys = Object.keys(o);
+  var preferred = ["descricao","pedido","multa","tipo","valor","valor_formatado","data","data_hora","dataHora","origem","tribunal","sistema","observacao","observacoes"];
+  keys.sort(function(a,b){
+    var ia = preferred.indexOf(a), ib = preferred.indexOf(b);
+    if(ia !== -1 || ib !== -1){
+      if(ia === -1) return 1;
+      if(ib === -1) return -1;
+      return ia - ib;
+    }
+    return a.localeCompare(b);
+  });
+  return keys.map(function(k){ return [k, o[k]]; });
+}
+
+function renderCards(title, items){
+  var arr = Array.isArray(items) ? items : [];
+  if(arr.length === 0){
+    return "<div class='d-flex justify-content-between align-items-center mb-2'>"
+      + "<div class='h6 mb-0'>" + esc(title) + "</div>"
+      + "<span class='badge-soft p-2'>0</span>"
+      + "</div>"
+      + "<div class='muted'>Nada encontrado.</div>";
+  }
+  var html = "<div class='d-flex justify-content-between align-items-center mb-2'>"
+    + "<div class='h6 mb-0'>" + esc(title) + "</div>"
+    + "<span class='badge-soft p-2'>" + esc(String(arr.length)) + "</span>"
+    + "</div>";
+  html += "<div class='d-grid gap-2'>";
+  for(var i=0;i<arr.length;i++){
+    var it = arr[i];
+    if(typeof it === "string" || typeof it === "number" || typeof it === "boolean"){
+      html += "<div class='p-2' style='border:1px solid var(--border); border-radius:14px; background:rgba(48,80,160,.03);'>"
+           + "<div class='wrap'>" + esc(String(it)) + "</div></div>";
+      continue;
+    }
+    if(!it || typeof it !== "object"){
+      html += "<div class='p-2 muted' style='border:1px solid var(--border); border-radius:14px;'>Item inválido</div>";
+      continue;
+    }
+    var pairs = objToPairs(it);
+    var head = "";
+    var titleGuess = safeText(it.descricao || it.pedido || it.multa || it.tipo || "");
+    if(titleGuess){
+      head = "<div style='font-weight:800' class='mb-1'>" + esc(titleGuess) + "</div>";
+    }
+    var rows = "";
+    for(var p=0;p<pairs.length;p++){
+      var k = pairs[p][0];
+      var v = pairs[p][1];
+      if(v === null || v === undefined || v === "") continue;
+      var vv = (String(k).toLowerCase().includes("valor")) ? safeMoney(v) : safeText(v);
+      if(!vv) continue;
+      rows += "<div class='d-flex justify-content-between gap-2 py-1' style='border-top:1px dashed rgba(0,0,0,.08);'>"
+           + "<div class='muted small' style='min-width:120px'>" + esc(k) + "</div>"
+           + "<div class='mono small text-end wrap' style='max-width:70%'>" + esc(vv) + "</div>"
+           + "</div>";
+    }
+    if(!rows){
+      rows = "<div class='muted small'>Sem campos estruturados; exibindo JSON.</div>"
+           + "<pre class='small mb-0'>" + esc(JSON.stringify(it, null, 2)) + "</pre>";
+    }
+    html += "<div class='p-2' style='border:1px solid var(--border); border-radius:14px; background:rgba(48,80,160,.03);'>"
+         + head + rows + "</div>";
+  }
+  html += "</div>";
+  return html;
+}
+
+async function loadPedidosMultas(force){
+  clearInlineBanner("bn-pedmult");
+  var pedidosBox = document.getElementById("pedidos-box");
+  var multasBox = document.getElementById("multas-box");
+  var valorCausaBox = document.getElementById("valor-causa-box");
+  var valoresMovsBox = document.getElementById("valores-movs-box");
+  var peticaoBox = document.getElementById("peticao-box");
+  pedidosBox.innerHTML = '<span class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando…</span>';
+  multasBox.innerHTML  = '<span class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando…</span>';
+  if(valorCausaBox) valorCausaBox.innerHTML = "";
+  if(valoresMovsBox) valoresMovsBox.innerHTML = "";
+  if(peticaoBox) peticaoBox.innerHTML = "";
+
+  try{
+    var url = "/ui/api/processo/" + encodeURIComponent(CNJ) + "/pedidos-multas";
+    if(force) url += "?refresh=1";
+    var r = await fetch(url);
+    var j = await r.json();
+    if(!j.ok){
+      var msg = esc(j.message || j.error || ("HTTP " + r.status));
+      showInlineBanner("bn-pedmult","warning","Falha ao carregar", msg);
+      pedidosBox.innerHTML = "<div class='muted'>Sem dados.</div>";
+      multasBox.innerHTML = "<div class='muted'>Sem dados.</div>";
+      return;
+    }
+
+    // Valor da Causa
+    if(valorCausaBox){
+      if(j.valor_causa){
+        valorCausaBox.innerHTML = "<div class='card p-3 mb-2' style='border-left:4px solid var(--accent);'>"
+          + "<div class='muted small mb-1'>Valor da Causa</div>"
+          + "<div style='font-size:1.4rem;font-weight:800;color:var(--accent)'>" + esc(j.valor_causa) + "</div>"
+          + "</div>";
+      } else {
+        valorCausaBox.innerHTML = "<div class='muted small mb-2'>Valor da causa não encontrado na capa.</div>";
+      }
+    }
+
+    // Pedidos e Multas
+    pedidosBox.innerHTML = renderCards("Pedidos", j.pedidos || []);
+    multasBox.innerHTML = renderCards("Multas", j.multas || []);
+    if((j.pedidos||[]).length === 0 && (j.multas||[]).length === 0){
+      // Só mostrar o banner se também não há valor_causa nem valores_movs
+      if(!j.valor_causa && !(j.valores_movs && j.valores_movs.length > 0)){
+        showInlineBanner("bn-pedmult","info","Sem registros","A capa não retornou pedidos/multas para este CNJ (ou a fonte não disponibiliza).");
+      }
+    } else if(j.cached){
+      try{ showToast("info","Pedidos & Multas", j.stale ? "Cache (stale) usado" : "Cache usado", 2200); }catch(e){}
+    }
+
+    // Valores nas Movimentações
+    if(valoresMovsBox){
+      var movs = j.valores_movs || [];
+      if(movs.length > 0){
+        var movsHtml = "<div class='card p-3 mb-2'><div style='font-weight:700' class='mb-2'>Valores encontrados nas Movimentações</div><div class='d-flex flex-column gap-2'>";
+        for(var i=0;i<movs.length;i++){
+          var m = movs[i];
+          var valorOrKeyword = "";
+          if(m.valor){
+            valorOrKeyword = "<span class='mono' style='font-weight:700;color:var(--accent)'>" + esc(m.valor) + "</span>";
+          } else if(m.keyword){
+            valorOrKeyword = "<span class='badge' style='background:var(--border);color:var(--text-muted);font-size:0.75rem;border-radius:6px;padding:2px 8px;font-weight:600'>" + esc(m.keyword) + "</span>";
+          }
+          movsHtml += "<div style='border:1px solid var(--border);border-radius:10px;padding:8px 12px;'>"
+            + "<div class='d-flex justify-content-between'>"
+            + "<span class='muted small'>" + esc(m.data||"") + "</span>"
+            + valorOrKeyword
+            + "</div>"
+            + "<div class='small mt-1 wrap'>" + esc(m.descricao||"") + "</div>"
+            + "</div>";
+        }
+        movsHtml += "</div></div>";
+        valoresMovsBox.innerHTML = movsHtml;
+      } else {
+        valoresMovsBox.innerHTML = "<div class='muted small mb-2'>Nenhum valor monetário encontrado nas movimentações.</div>";
+      }
+    }
+
+    // Petição Inicial / Documentos
+    if(peticaoBox){
+      if(j.has_docs_publicos){
+        peticaoBox.innerHTML = "<div class='alert alert-info py-2 px-3 mb-2 small'>"
+          + "📄 <strong>Petição Inicial disponível:</strong> Consulte a aba "
+          + "<a href='#' id='link-goto-docs'>Documentos</a>"
+          + " para ver a Petição Inicial com o valor da causa e pedidos detalhados."
+          + "</div>";
+        var linkDocs = document.getElementById("link-goto-docs");
+        if(linkDocs){
+          linkDocs.addEventListener("click", function(ev){
+            ev.preventDefault();
+            var tab = document.querySelector('[data-bs-target="#pane-docs"]');
+            if(tab) tab.click();
+          });
+        }
+      }
+    }
+
+  } catch(e){
+    showInlineBanner("bn-pedmult","danger","Erro ao carregar", esc(e.toString()));
+    pedidosBox.innerHTML = "<div class='muted'>Falha.</div>";
+    multasBox.innerHTML = "<div class='muted'>Falha.</div>";
+  }
+}
+document.getElementById("prev").addEventListener("click", function(){
+  offset = Math.max(0, offset - limit);
+  loadMovs();
+});
+document.getElementById("next").addEventListener("click", function(){
+  offset = offset + limit;
+  loadMovs();
+});
+document.getElementById("btn-filtrar").addEventListener("click", function(){
+  q = document.getElementById("q").value.trim();
+  tipo = document.getElementById("tipo").value.trim().toUpperCase();
+  offset = 0;
+  loadMovs();
+});
+document.getElementById("btn-side-search").addEventListener("click", function(){
+  q = document.getElementById("q_side").value.trim();
+  document.getElementById("q").value = q;
+  offset = 0;
+  loadMovs();
+});
+
+document.getElementById("btn-sync").addEventListener("click", async function(){
+  clearInlineBanner("bn-summary");
+  clearInlineBanner("bn-capa");
+  clearInlineBanner("bn-movs");
+  var btn = document.getElementById("btn-sync");
+  btn.disabled = true;
+  btn.textContent = "Sincronizando…";
+  try{
+    var r = await fetch("/processos/" + encodeURIComponent(CNJ) + "/sync", { method:"POST" });
+    var j = null;
+    try { j = await r.json(); } catch(_e){ j = { ok:false, error:"RESPOSTA_INVALIDA", message:"Resposta não-JSON do servidor." }; }
+    if(j.ok){
+      showToast("success","Sync concluído","Novos eventos: " + j.new_events);
+      offset = 0;
+      await loadMovs();
+      await loadCapaPalatavel();
+    } else {
+      var msg = (j.message || j.error || ("HTTP " + r.status));
+      showToast("danger","Sync falhou", msg);
+      showInlineBanner("bn-summary","danger","Sync falhou", esc(msg));
+    }
+  } catch(e){
+    showToast("danger","Erro ao sincronizar", e.toString());
+    showInlineBanner("bn-summary","danger","Erro ao sincronizar", esc(e.toString()));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Sync agora";
+  }
+});
+
+async function loadDocs(){
+  clearInlineBanner("bn-docs");
+  var box = document.getElementById("docs-box");
+  if(!box) return;
+  var tipo = document.getElementById("docsTipoAutos") && document.getElementById("docsTipoAutos").checked ? "autos" : "publicos";
+  box.innerHTML = '<div class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando documentos…</div>';
+
+  var r=null, j=null;
+  try{
+    r = await fetch("/ui/api/processo/" + encodeURIComponent(CNJ) + "/documentos?tipo=" + encodeURIComponent(tipo));
+    try { j = await r.json(); } catch(_e){ j = { ok:false, error:"RESPOSTA_INVALIDA", message:"Resposta não-JSON do servidor." }; }
+  }catch(e){
+    showInlineBanner("bn-docs","danger","Falha ao carregar documentos", esc(e.toString()));
+    box.innerHTML = '<div class="muted">Sem documentos.</div>';
+    return;
+  }
+
+  if(!j.ok){
+    showInlineBanner("bn-docs","warning","Documentos indisponíveis", esc(j.message || j.error || ("HTTP " + (r ? r.status : ""))));
+    box.innerHTML = '<div class="muted">Sem documentos.</div>';
+    return;
+  }
+
+  var items = j.items || [];
+  if(!Array.isArray(items) || items.length === 0){
+    var hint = "Nenhum documento encontrado no cache.";
+    if(j.warning) hint += " " + esc(j.warning);
+    hint += " Se você acabou de adicionar o processo, clique em <b>Atualizar no tribunal</b> para baixar " + (tipo==="autos" ? "os autos" : "documentos públicos") + ".";
+    box.innerHTML = "<div class='muted'>" + hint + "</div>";
+    return;
+  }
+
+  items.sort(function(a, b){
+    var da = a.data_disponibilizacao || a.dataDisponibilizacao || a.data || (a.meta && (a.meta.data || a.meta.data_documento || a.meta.data_disponibilizacao)) || "";
+    var db = b.data_disponibilizacao || b.dataDisponibilizacao || b.data || (b.meta && (b.meta.data || b.meta.data_documento || b.meta.data_disponibilizacao)) || "";
+    da = (da && typeof da === "object") ? (da.data || da.data_documento || da.dataHora || da.data_hora || "") : da;
+    db = (db && typeof db === "object") ? (db.data || db.data_documento || db.dataHora || db.data_hora || "") : db;
+    if(!da && !db) return 0;
+    if(!da) return 1;
+    if(!db) return -1;
+    return db.localeCompare(da);
+  });
+
+  var html = "";
+  html += "<div class='d-flex justify-content-between align-items-center mb-2'>";
+  html += "  <div class='muted small'>Fonte: " + esc(j.source || "cache") + "</div>";
+  html += "  <div class='muted small'>Itens: " + items.length + "</div>";
+  html += "</div>";
+
+  html += "<div class='list-group'>";
+  for(var i=0;i<items.length;i++){
+    var it = items[i] || {};
+    var key = it.doc_key || it.key || "";
+    var titulo = it.titulo || it.descricao || (it.meta && (it.meta.titulo || it.meta.nome)) || ("Documento " + (i+1));
+    var dataRaw = it.data_disponibilizacao || it.dataDisponibilizacao || it.data || (it.meta && (it.meta.data || it.meta.data_documento || it.meta.data_disponibilizacao)) || "";
+    var dataStr = (dataRaw && typeof dataRaw === "object") ? (dataRaw.data || dataRaw.data_documento || dataRaw.dataHora || dataRaw.data_hora || "") : dataRaw;
+    var tipo = it.tipo || (it.meta && it.meta.tipo) || "";
+    var ext = it.extensao_arquivo || (it.meta && it.meta.extensao_arquivo) || "";
+    var mime = it.mime || (it.meta && (it.meta.mime || it.meta.mime_type)) || "";
+    var paginas = (it.quantidade_paginas != null) ? it.quantidade_paginas : "";
+    var formato = ext || mime || "";
+    var dlParams = new URLSearchParams();
+    if(dataStr) dlParams.set("data", dataStr);
+    if(tipo) dlParams.set("tipo", tipo);
+    if(ext) dlParams.set("ext", ext);
+    var dlBase = "/ui/api/processo/" + encodeURIComponent(CNJ) + "/documentos/" + encodeURIComponent(key);
+    var dl = dlBase + "/download?" + dlParams.toString();
+    var previewUrl = dlBase + "/preview";
+    var metaParts = [];
+    if(tipo) metaParts.push(esc(tipo));
+    if(formato) metaParts.push(esc(formato));
+    if(paginas !== "") metaParts.push(paginas + " pág.");
+    html += "<div class='list-group-item'>";
+    html += "  <div class='d-flex justify-content-between align-items-start gap-2'>";
+    html += "    <div>";
+    html += "      <div class='fw-semibold'>" + esc(titulo) + "</div>";
+    html += "      <div class='muted small'>📅 " + esc(fmtDt(dataStr)) + "</div>";
+    html += "      <div class='muted small'>" + (metaParts.length ? metaParts.join(" · ") : "—") + "</div>";
+    html += "    </div>";
+    html += "    <div class='text-nowrap d-flex gap-1'>";
+    if(key){
+      html += "      <button class='btn btn-outline-secondary btn-sm' onclick=\\"openPreview('" + previewUrl.replace(/'/g, "%27") + "', '" + esc(titulo).replace(/'/g, "\\'") + "')\\">👁 Pré-visualizar</button>";
+      html += "      <a class='btn btn-outline-primary btn-sm' href='" + dl + "' target='_blank'>⬇ Download</a>";
+    }else{
+      html += "      <span class='muted small'>Sem chave</span>";
+    }
+    html += "    </div>";
+    html += "  </div>";
+    html += "</div>";
+  }
+  html += "</div>";
+  box.innerHTML = html;
+}
+
+var __docsPollTimer = null;
+var __docsPollTries = 0;
+
+async function pollDocsStatus(tipo){
+  if(__docsPollTimer){ clearInterval(__docsPollTimer); __docsPollTimer = null; }
+  __docsPollTries = 0;
+
+  __docsPollTimer = setInterval(async function(){
+    __docsPollTries += 1;
+    if(__docsPollTries > 30){
+      clearInterval(__docsPollTimer); __docsPollTimer = null;
+      showInlineBanner("bn-docs","warning","Atualização em andamento", "Ainda não finalizou. Você pode recarregar mais tarde.");
+      return;
+    }
+    try{
+      var r = await fetch("/ui/api/processo/" + encodeURIComponent(CNJ) + "/status-atualizacao");
+      var j = await r.json();
+      if(j && j.ok){
+        var sv = (j.status || "").toString().toUpperCase();
+        if(sv === "SUCESSO"){
+          clearInterval(__docsPollTimer); __docsPollTimer = null;
+          showInlineBanner("bn-docs","success","Atualização concluída", "Documentos disponíveis. Recarregando…");
+          await loadDocs();
+        }else if(sv === "ERRO" || sv === "FALHA"){
+          clearInterval(__docsPollTimer); __docsPollTimer = null;
+          showInlineBanner("bn-docs","danger","Atualização falhou", esc((j.status_json ? JSON.stringify(j.status_json) : sv).slice(0,400)));
+        }else{
+          showInlineBanner("bn-docs","info","Atualizando…", "Status: " + esc(sv || "PENDENTE"));
+        }
+      }
+    }catch(_e){
+      // ignore
+    }
+  }, 2000);
+}
+
+async function requestDocsUpdate(){
+  clearInlineBanner("bn-docs");
+  var tipo_ui = document.getElementById("docsTipoAutos") && document.getElementById("docsTipoAutos").checked ? "autos" : "publicos";
+  var tipo = (tipo_ui === "autos") ? "autos" : "documentos_publicos";
+
+  showInlineBanner("bn-docs","info","Solicitando atualização…","Enviando requisição para o tribunal via Escavador.");
+
+  var credBody = {};
+  if(tipo_ui === "autos"){
+    var autosUsuario = document.getElementById("autosUsuario");
+    var autosSenha = document.getElementById("autosSenha");
+    var autosCertId = document.getElementById("autosCertId");
+    if(autosUsuario && autosUsuario.value.trim()) credBody.usuario = autosUsuario.value.trim();
+    if(autosSenha && autosSenha.value) credBody.senha = autosSenha.value;
+    if(autosCertId && autosCertId.value.trim()){ var certIdVal = parseInt(autosCertId.value.trim(), 10); if(!isNaN(certIdVal)) credBody.certificado_id = certIdVal; }
+  }
+
+  try{
+    var r = await fetch("/ui/api/processo/" + encodeURIComponent(CNJ) + "/solicitar-atualizacao", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({ tipo: tipo }, credBody))
+    });
+    var j = null;
+    try{ j = await r.json(); }catch(_e){ j = { ok:false, error:"RESPOSTA_INVALIDA", message:"Resposta não-JSON do servidor." }; }
+    if(!j.ok){
+      showInlineBanner("bn-docs","danger","Falha ao solicitar", esc(j.message || j.error || ("HTTP " + r.status)));
+      return;
+    }
+    showInlineBanner("bn-docs","info","Atualização solicitada","Aguardando processamento…");
+    await pollDocsStatus(tipo_ui);
+  }catch(e){
+    showInlineBanner("bn-docs","danger","Falha ao solicitar", esc(e.toString()));
+  }
+}
+
+async function loadLinkedDocs(){
+  clearInlineBanner("bn-linked");
+  var box = document.getElementById("linkedDocs");
+  box.textContent = "Carregando…";
+  try{
+    var r = await fetch("/processos/" + encodeURIComponent(CNJ) + "/docs");
+    var j = await r.json();
+    if(!j.ok){
+      showInlineBanner("bn-linked","warning","Falha ao carregar vínculos", esc(j.message || j.error || "erro"));
+      box.textContent = "Falha ao carregar vínculos.";
+      return;
+    }
+  var items = j.items || [];
+  if(items.length === 0){
+    box.innerHTML = "<span class='muted'>Nenhum doc vinculado ainda.</span>";
+    return;
+  }
+  var html = "";
+  for(var i=0;i<items.length;i++){
+    var x = items[i];
+    html += "<span class='badge-soft p-2 me-2 mb-2 d-inline-flex align-items-center gap-2'>"
+      + "<span class='mono'>" + esc(x.doc) + "</span>"
+      + "<button class='btn btn-outline-danger btn-mini js-unlink' data-doc='" + esc(x.doc) + "'>remover</button>"
+      + "</span>";
+  }
+  box.innerHTML = html;
+  // bind unlink handlers (avoid inline onclick quoting issues)
+  var bs = box.querySelectorAll(".js-unlink");
+  for(var k=0;k<bs.length;k++){
+    (function(doc){
+      bs[k].addEventListener("click", function(){ unlinkDoc(doc); });
+    })(bs[k].getAttribute("data-doc"));
+  }
+  } catch(e){
+    showInlineBanner("bn-linked","danger","Erro ao carregar vínculos", esc(e.toString()));
+    box.textContent = "Falha ao carregar vínculos.";
+  }
+}
+
+async function unlinkDoc(doc){
+  if(!confirm("Remover vínculo desse doc?\\n" + doc)) return;
+  var r = await fetch("/docs/link", { method:"DELETE", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ doc: doc, cnj: CNJ }) });
+  var j = await r.json();
+  if(j.ok) loadLinkedDocs();
+  else showToast("danger","Falhou",(j.message || j.error || "erro"));
+}
+
+document.getElementById("btnLinkDoc").addEventListener("click", async function(){
+  var status = document.getElementById("link-status");
+  var fromSelect = (document.getElementById("docSelect").value || "").trim();
+  var fromManual = (document.getElementById("docManual").value || "").trim();
+  var doc = fromManual || fromSelect;
+  if(!doc){
+    status.textContent = "Informe um CPF/CNPJ.";
+    return;
+  }
+  status.textContent = "Vinculando…";
+  var r = await fetch("/docs/link", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ doc: doc, cnj: CNJ }) });
+  var j = await r.json();
+  if(j.ok){
+    status.textContent = "Vínculo criado ✅";
+    document.getElementById("docManual").value = "";
+    loadLinkedDocs();
+  } else {
+    status.textContent = "Falhou: " + (j.message || j.error || "erro");
+  }
+});
+
+// Quick chips (tipo)
+function setActiveChip(tipoValue){
+  var chips = document.querySelectorAll("#quick-chips .chip-click");
+  for(var i=0;i<chips.length;i++){
+    var el = chips[i];
+    var t = (el.getAttribute("data-t")||"").toUpperCase();
+    if(t === (tipoValue||"").toUpperCase() && t !== ""){
+      el.classList.add("chip-active");
+    } else {
+      el.classList.remove("chip-active");
+    }
+  }
+}
+document.getElementById("quick-chips").addEventListener("click", function(ev){
+  var el = ev.target;
+  if(!el || !el.classList.contains("chip-click")) return;
+  var t = (el.getAttribute("data-t") || "").toUpperCase();
+  tipo = t;
+  document.getElementById("tipo").value = tipo;
+  offset = 0;
+  setActiveChip(tipo);
+  loadMovs();
+});
+
+
+// Lazy-load Pedidos & Multas when tab is opened
+try{
+  var tabPed = document.querySelector('button[data-bs-target="#pane-pedmult"]');
+  if(tabPed){
+    tabPed.addEventListener("click", function(){
+      if(!pedmultLoadedOnce){
+        pedmultLoadedOnce = true;
+        loadPedidosMultas(false);
+      }
+    });
+  }
+  var btnRefresh = document.getElementById("btn-pedmult-refresh");
+  if(btnRefresh){
+    btnRefresh.addEventListener("click", function(){ loadPedidosMultas(true); });
+  }
+}catch(e){}
+
+// Documentos tab
+try{
+  var btnDocsRefresh = document.getElementById("btn-docs-refresh");
+  if(btnDocsRefresh) btnDocsRefresh.addEventListener("click", function(){ loadDocs(); });
+
+  var btnDocsUpdate = document.getElementById("btn-docs-update");
+  if(btnDocsUpdate) btnDocsUpdate.addEventListener("click", function(){ requestDocsUpdate(); });
+
+  var rdPub = document.getElementById("docsTipoPub");
+  var rdAutos = document.getElementById("docsTipoAutos");
+  function toggleCredsPanel(){
+    var panel = document.getElementById("autos-creds-panel");
+    if(panel) panel.style.display = (rdAutos && rdAutos.checked) ? "" : "none";
+  }
+  if(rdPub) rdPub.addEventListener("change", function(){ toggleCredsPanel(); loadDocs(); });
+  if(rdAutos) rdAutos.addEventListener("change", function(){ toggleCredsPanel(); loadDocs(); });
+
+  var tabDocsBtn = document.querySelector('button[data-bs-target="#pane-docs"]');
+  if(tabDocsBtn){
+    tabDocsBtn.addEventListener("click", function(){
+      setTimeout(loadDocs, 50);
+    });
+  }
+}catch(_e){}
+loadCapaPalatavel();
+loadMovs();
+loadLinkedDocs();
+(function(){
+  if(document.getElementById("docPreviewModal")) return;
+  var m = document.createElement("div");
+  m.innerHTML = "<div class=\\"modal fade\\" id=\\"docPreviewModal\\" tabindex=\\"-1\\" aria-labelledby=\\"docPreviewLabel\\" aria-hidden=\\"true\\"><div class=\\"modal-dialog modal-xl\\"><div class=\\"modal-content bg-dark text-light\\"><div class=\\"modal-header border-secondary\\"><h5 class=\\"modal-title\\" id=\\"docPreviewLabel\\">Pré-visualização</h5><button type=\\"button\\" class=\\"btn-close btn-close-white\\" data-bs-dismiss=\\"modal\\" aria-label=\\"Fechar\\"></button></div><div class=\\"modal-body p-0\\" style=\\"height:80vh;\\"><iframe id=\\"docPreviewFrame\\" src=\\"\\" style=\\"width:100%;height:100%;border:none;\\"></iframe></div></div></div></div>";
+  document.body.appendChild(m.firstChild);
+})();
+window.openPreview = function(url, titulo){
+  if(typeof url !== "string" || !url.startsWith("/ui/api/processo/")) return;
+  document.getElementById("docPreviewFrame").src = url;
+  document.getElementById("docPreviewLabel").textContent = titulo || "Pré-visualização";
+  var modal = new bootstrap.Modal(document.getElementById("docPreviewModal"));
+  modal.show();
+};
+</script>
+    """
+
+    body = body.replace("__CNJ__", cnj).replace("__OPTS__", opts).replace("__CNJ_JSON__", cnj_json)
+    return render_template_string(UI_BASE, body=body)
+
+
+# ---------------- UI API proxies ----------------
+@app.get("/ui/api/processo/<path:cnj>/capa")
+def ui_api_capa(cnj: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ_INVALIDO"}), 400
+
+    refresh = (request.args.get("refresh") or "").strip() in ("1", "true", "yes")
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    def _get_cached():
+        try:
+            with db_conn() as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute("SELECT payload, updated_at FROM capa_cache WHERE cnj=?", (cnj,))
+                r = cur.fetchone()
+                if not r:
+                    return None
+                updated_at = r["updated_at"]
+                try:
+                    ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                except Exception:
+                    ts = None
+                if ts and (datetime.now(timezone.utc) - ts).total_seconds() <= CAPA_CACHE_TTL_SECONDS:
+                    return json.loads(r["payload"])
+        except Exception:
+            return None
+        return None
+
+    def _set_cached(payload: dict):
+        try:
+            with db_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO capa_cache(cnj,payload,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(cnj) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at",
+                    (cnj, json.dumps(payload, ensure_ascii=False), now_iso),
+                )
+                conn.commit()
+        except Exception:
+            pass
+
+    if not refresh:
+        cached = _get_cached()
+        if cached is not None:
+            return jsonify({"ok": True, "cached": True, "data": cached})
+
+    try:
+        data = client.obter_capa_processo(cnj)  # type: ignore[attr-defined]
+        _set_cached(data)
+        return jsonify({"ok": True, "cached": False, "data": data})
+    except requests.RequestException as e:
+        _set_last_api_error(method="GET", path="/processos/{cnj}/capa", status=None, message=str(e))
+        cached = _get_cached()
+        if cached is not None:
+            return jsonify({"ok": True, "cached": True, "stale": True, "data": cached, "warning": "API_FAIL_USING_CACHE"})
+        return jsonify({"ok": False, "error": "ESCAVADOR_UNAVAILABLE", "message": str(e)}), 502
+
+
+def _collect_key_anywhere(obj: Any, keys: set) -> List[Any]:
+    # Percorre recursivamente dict/list e coleta valores de chaves específicas.
+    out: List[Any] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            lk = str(k).strip().lower()
+            if lk in keys:
+                out.append(v)
+            if isinstance(v, (dict, list)):
+                out.extend(_collect_key_anywhere(v, keys))
+    elif isinstance(obj, list):
+        for it in obj:
+            if isinstance(it, (dict, list)):
+                out.extend(_collect_key_anywhere(it, keys))
+    return out
+
+def _normalize_to_list(v: Any) -> List[Any]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, dict):
+        return [v]
+    return [v]
+
+@app.get("/ui/api/processo/<path:cnj>/pedidos-multas")
+def ui_api_pedidos_multas(cnj: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ_INVALIDO"}), 400
+
+    refresh = (request.args.get("refresh") or "").strip() in ("1", "true", "yes")
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    def _get_cached():
+        try:
+            with db_conn() as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute("SELECT payload, updated_at FROM capa_cache WHERE cnj=?", (cnj,))
+                r = cur.fetchone()
+                if not r:
+                    return None, None
+                updated_at = r["updated_at"]
+                try:
+                    ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                except Exception:
+                    ts = None
+                payload = json.loads(r["payload"])
+                if ts and (datetime.now(timezone.utc) - ts).total_seconds() <= CAPA_CACHE_TTL_SECONDS:
+                    return payload, False
+                return payload, True  # stale
+        except Exception:
+            return None, None
+
+    def _set_cached(payload: dict):
+        try:
+            with db_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO capa_cache(cnj,payload,updated_at) VALUES(?,?,?) "
+                    "ON CONFLICT(cnj) DO UPDATE SET payload=excluded.payload, updated_at=excluded.updated_at",
+                    (cnj, json.dumps(payload, ensure_ascii=False), now_iso),
+                )
+                conn.commit()
+        except Exception:
+            pass
+
+    cached_payload, is_stale = (None, None)
+    if not refresh:
+        cached_payload, is_stale = _get_cached()
+
+    data = None
+    used_cache = False
+    stale_used = False
+
+    if not refresh:
+        if cached_payload is not None and is_stale is False:
+            data = cached_payload
+            used_cache = True
+        else:
+            try:
+                data = client.obter_capa_processo(cnj)  # type: ignore[attr-defined]
+                _set_cached(data)
+            except requests.RequestException as e:
+                _set_last_api_error(method="GET", path="/processos/{cnj}", status=None, message=str(e))
+                if cached_payload is not None:
+                    data = cached_payload
+                    used_cache = True
+                    stale_used = True
+                else:
+                    return jsonify({"ok": False, "error": "ESCAVADOR_UNAVAILABLE", "message": str(e)}), 502
+    else:
+        try:
+            data = client.obter_capa_processo(cnj)  # type: ignore[attr-defined]
+            _set_cached(data)
+        except requests.RequestException as e:
+            _set_last_api_error(method="GET", path="/processos/{cnj}", status=None, message=str(e))
+            cached_payload, _st = _get_cached()
+            if cached_payload is not None:
+                data = cached_payload
+                used_cache = True
+                stale_used = True
+            else:
+                return jsonify({"ok": False, "error": "ESCAVADOR_UNAVAILABLE", "message": str(e)}), 502
+
+    pedidos_vals = _collect_key_anywhere(data, {"pedidos", "pedido"})
+    multas_vals = _collect_key_anywhere(data, {"multas", "multa"})
+
+    pedidos: List[Any] = []
+    multas: List[Any] = []
+    for v in pedidos_vals:
+        pedidos.extend(_normalize_to_list(v))
+    for v in multas_vals:
+        multas.extend(_normalize_to_list(v))
+
+    def _dedupe(items: List[Any]) -> List[Any]:
+        seen = set()
+        out = []
+        for it in items:
+            try:
+                if isinstance(it, (dict, list)):
+                    h = stable_hash(it)
+                else:
+                    h = stable_hash({"v": str(it)})
+            except Exception:
+                h = str(it)
+            if h in seen:
+                continue
+            seen.add(h)
+            out.append(it)
+        return out
+
+    pedidos = _dedupe(pedidos)
+    multas = _dedupe(multas)
+
+    # --- 1. Valor da Causa (da capa_cache) ---
+    _VALOR_CAUSA_KEYS = {"valor_causa", "valor_causa_formatado", "valorcausa", "vl_causa", "valor_da_causa"}
+    valor_causa_vals = _collect_key_anywhere(data, _VALOR_CAUSA_KEYS)
+    valor_causa: Optional[str] = None
+    for vc in valor_causa_vals:
+        if vc is None:
+            continue
+        # Se for dict, extrair valor_formatado ou construir de moeda + valor
+        if isinstance(vc, dict):
+            if vc.get("valor_formatado") and str(vc["valor_formatado"]).strip():
+                s = str(vc["valor_formatado"]).strip()
+            elif vc.get("moeda") and vc.get("valor"):
+                try:
+                    num = float(str(vc["valor"]).replace(".", "").replace(",", "."))
+                    formatted = "{:,.2f}".format(num)
+                    s = str(vc["moeda"]).strip() + " " + formatted.replace(",", "X").replace(".", ",").replace("X", ".")
+                except (ValueError, OverflowError):
+                    s = str(vc.get("valor_formatado") or vc.get("valor") or "").strip()
+            elif vc.get("valor"):
+                s = str(vc["valor"]).strip()
+            else:
+                continue
+        else:
+            s = str(vc).strip()
+
+        if not s:
+            continue
+
+        # Se já contém R$, usa direto; caso contrário, tenta formatar como moeda
+        if "R$" in s:
+            valor_causa = s
+        else:
+            try:
+                num = float(s.replace(".", "").replace(",", "."))
+                # Formata no padrão brasileiro: R$ 1.234,56
+                formatted = "{:,.2f}".format(num)
+                valor_causa = "R$ " + formatted.replace(",", "X").replace(".", ",").replace("X", ".")
+            except (ValueError, OverflowError):
+                valor_causa = s
+        break
+
+    # --- 2. Valores extraídos das Movimentações ---
+    _MOV_TEXT_LIMIT = 300
+    _MOV_VALUE_RE = re.compile(r"R\$\s*[\d.,]+", re.IGNORECASE)
+    _MOV_KW_RE = re.compile(
+        r"\b(multa|condena[çc][aã]o|penhora|indeniza[çc][aã]o|honor[aá]rios|valor)\b",
+        re.IGNORECASE,
+    )
+    valores_movs: List[dict] = []
+    try:
+        with db_conn() as conn_mov:
+            conn_mov.row_factory = sqlite3.Row
+            cur_mov = conn_mov.cursor()
+            cur_mov.execute(
+                "SELECT data, texto FROM eventos_mov WHERE cnj=? ORDER BY data DESC LIMIT 500",
+                (cnj,),
+            )
+            for row_mov in cur_mov.fetchall():
+                texto = (row_mov["texto"] or "").strip()
+                if not texto:
+                    continue
+                found_vals = _MOV_VALUE_RE.findall(texto)
+                if found_vals:
+                    valores_movs.append({
+                        "data": row_mov["data"] or "",
+                        "descricao": texto[:_MOV_TEXT_LIMIT],
+                        "valor": found_vals[0].strip(),
+                        "keyword": "",
+                    })
+                else:
+                    kw_match = _MOV_KW_RE.search(texto)
+                    if not kw_match:
+                        continue
+                    keyword_found = kw_match.group(0).lower()
+                    valores_movs.append({
+                        "data": row_mov["data"] or "",
+                        "descricao": texto[:_MOV_TEXT_LIMIT],
+                        "valor": "",
+                        "keyword": keyword_found,
+                    })
+    except Exception:
+        pass
+
+    # --- 3. Verificar documentos públicos (docs_v2_cache) ---
+    has_docs_publicos = False
+    try:
+        with db_conn() as conn_docs:
+            conn_docs.row_factory = sqlite3.Row
+            cur_docs = conn_docs.cursor()
+            cur_docs.execute(
+                "SELECT 1 FROM docs_v2_cache WHERE cnj=? AND tipo='publicos' LIMIT 1",
+                (cnj,),
+            )
+            has_docs_publicos = cur_docs.fetchone() is not None
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok": True,
+        "cached": bool(used_cache),
+        "stale": bool(stale_used),
+        "pedidos": pedidos,
+        "multas": multas,
+        "valor_causa": valor_causa,
+        "valores_movs": valores_movs,
+        "has_docs_publicos": has_docs_publicos,
+    })
+
+
+# ============================================================
+# UI API: Documentos / Solicitar atualização / Status / Download
+# ============================================================
+
+@app.get("/ui/api/processo/<path:cnj>/documentos")
+def ui_api_documentos(cnj: str):
+    """Proxy da aba Documentos na UI de processo → cache docs_v2_cache (Escavador v2)."""
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
+
+    tipo = (request.args.get("tipo") or "publicos").strip().lower()
+    if tipo not in ("publicos", "autos"):
+        return jsonify({"ok": False, "error": "TIPO_INVALIDO", "message": "tipo deve ser publicos|autos"}), 400
+
+    limit_n = 50
+    page_n = 1
+
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT items_json, links_json, paginator_json, updated_at FROM docs_v2_cache "
+        "WHERE cnj=? AND tipo=? AND limit_n=? AND page_n=?",
+        (cnj, tipo, limit_n, page_n),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if row:
+        items_json, links_json, paginator_json, updated_at = row
+        return jsonify({
+            "ok": True, "cnj": cnj, "tipo": tipo, "source": "cache",
+            "items": json.loads(items_json),
+            "links": json.loads(links_json) if links_json else None,
+            "paginator": json.loads(paginator_json) if paginator_json else None,
+            "updated_at": updated_at,
+        })
+
+    # Sem cache: tenta buscar direto na API do Escavador
+    try:
+        require_token_configured()
+        if tipo == "publicos":
+            data = client.listar_documentos_publicos_v2(cnj, limit=limit_n, page=page_n)
+        else:
+            data = client.listar_autos_v2(cnj, limit=limit_n, page=page_n)
+
+        items = data.get("items") if isinstance(data, dict) else []
+        if not isinstance(items, list):
+            items = []
+        links = data.get("links") if isinstance(data, dict) else None
+        paginator = data.get("paginator") if isinstance(data, dict) else None
+
+        now = utcnow_iso()
+        if items:
+            conn = db_conn()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO docs_v2_cache"
+                "(cnj, tipo, limit_n, page_n, items_json, links_json, paginator_json, updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    cnj, tipo, limit_n, page_n,
+                    json.dumps(items, ensure_ascii=False),
+                    json.dumps(links, ensure_ascii=False) if links is not None else None,
+                    json.dumps(paginator, ensure_ascii=False) if paginator is not None else None,
+                    now,
+                ),
+            )
+            conn.commit()
+            conn.close()
+
+        return jsonify({
+            "ok": True, "cnj": cnj, "tipo": tipo, "source": "api",
+            "items": items, "links": links, "paginator": paginator, "updated_at": now,
+        })
+    except Exception as ex:
+        return jsonify({
+            "ok": True, "cnj": cnj, "tipo": tipo, "source": "empty",
+            "items": [], "warning": str(ex),
+        })
+
+
+@app.post("/ui/api/processo/<path:cnj>/solicitar-atualizacao")
+def ui_api_solicitar_atualizacao(cnj: str):
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
+    payload = request.get_json(force=True, silent=True) or {}
+    tipo = (payload.get("tipo") or "").strip().lower()
+    if tipo not in ("documentos_publicos", "autos"):
+        return jsonify({"ok": False, "error": "TIPO_INVALIDO", "message": "tipo deve ser documentos_publicos|autos"}), 400
+    return api_solicitar_atualizacao_v2(cnj)
+
+
+@app.get("/ui/api/processo/<path:cnj>/status-atualizacao")
+def ui_api_status_atualizacao(cnj: str):
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
+    return api_solicitar_status_v2(cnj)
+
+
+@app.get("/ui/api/processo/<path:cnj>/documentos/<path:key>/download")
+def ui_api_download_documento(cnj: str, key: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
+    data_doc = (request.args.get("data") or "").strip()[:20]
+    tipo_doc = (request.args.get("tipo") or "").strip()[:40]
+    ext_doc  = (request.args.get("ext")  or "pdf").strip()[:5]
+    try:
+        r = client.baixar_documento_pdf_v2(cnj, key)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+    cnj_safe  = re.sub(r"[^A-Za-z0-9_\-]", "_", cnj)[:40]
+    data_safe = re.sub(r"[^A-Za-z0-9_\-]", "_", data_doc)[:20] if data_doc else "sem_data"
+    tipo_safe = re.sub(r"[^A-Za-z0-9_\-]", "_", tipo_doc.replace(" ", "_"))[:30] if tipo_doc else "documento"
+    _allowed_exts = {"pdf", "doc", "docx", "odt", "rtf", "txt", "xls", "xlsx"}
+    ext_safe  = ext_doc.lower() if ext_doc.lower() in _allowed_exts else "pdf"
+    filename  = f"{cnj_safe}_{data_safe}_{tipo_safe}.{ext_safe}"
+    headers = {
+        "Content-Type": r.headers.get("Content-Type", "application/pdf"),
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }
+    return Response(r.content, status=200, headers=headers)
+
+
+@app.get("/ui/api/processo/<path:cnj>/documentos/<path:key>/preview")
+def ui_api_preview_documento(cnj: str, key: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
+    try:
+        r = client.baixar_documento_pdf_v2(cnj, key)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+    safe_key = re.sub(r"[^A-Za-z0-9_\-]", "_", key)[:64]
+    filename = f"documento_{safe_key}.pdf"
+    headers = {
+        "Content-Type": r.headers.get("Content-Type", "application/pdf"),
+        "Content-Disposition": f'inline; filename="{filename}"',
+    }
+    return Response(r.content, status=200, headers=headers)
+
+
+@app.get("/ui/admin")
+def ui_admin():
+    body = r"""
+    <div class="card p-3">
+      <div class="h5 mb-1">Admin</div>
+      <div class="muted">Ajustes operacionais do monitor (auto-discover, saúde, diagnósticos).</div>
+
+      <hr class="divider">
+
+      <div class="row g-2 align-items-end">
+        <div class="col-md-4">
+          <label class="form-label small muted">Adicionar doc (CPF/CNPJ)</label>
+          <input id="docInput" class="form-control" placeholder="000.000.000-00 ou 00.000.000/0000-00">
+        </div>
+        <div class="col-md-2">
+          <button id="btnAdd" class="btn btn-primary w-100">Adicionar</button>
+        </div>
+        <div class="col-md-6">
+          <div class="muted small">Dica: o botão “Descobrir” usa a rota <code>/envolvido/processos</code> da API v2 do Escavador.</div>
+          <div id="status" class="muted small mt-1"></div>
+        </div>
+      </div>
+
+      <hr class="divider">
+
+      <div class="card p-3 mb-3" style="background: rgba(255,255,255,.02); border: 1px solid rgba(255,255,255,.06);">
+        <div class="d-flex justify-content-between align-items-center">
+          <div>
+            <div class="h6 mb-0">Auto-Discover</div>
+            <div class="muted small">Descoberta automática de CNJs para cada doc da watchlist.</div>
+          </div>
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" role="switch" id="adEnabled">
+            <label class="form-check-label small muted" for="adEnabled">Ativo</label>
+          </div>
+        </div>
+
+        <div class="row g-2 mt-2 align-items-end">
+          <div class="col-md-3">
+            <label class="form-label small muted">Intervalo (seg)</label>
+            <input id="adInterval" type="number" min="10" class="form-control" placeholder="ex: 900">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small muted">Limite por doc</label>
+            <input id="adLimit" type="number" min="1" class="form-control" placeholder="ex: 50">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small muted">Máx docs/ciclo</label>
+            <input id="adMaxDocs" type="number" min="1" class="form-control" placeholder="ex: 50">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small muted">Modo econômico</label>
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" id="adOnlyNoLinks">
+              <label class="form-check-label small" for="adOnlyNoLinks">Só se não houver vínculos</label>
+            </div>
+          </div>
+        </div>
+
+        <div class="d-flex flex-wrap gap-2 mt-3 align-items-center">
+          <button id="btnSaveDiscover" class="btn btn-outline-light">Salvar</button>
+          <button id="btnReloadDiscover" class="btn btn-outline-secondary">Recarregar</button>
+          <button id="btnRunDiscover" class="btn btn-outline-primary">Rodar agora</button>
+          <div class="muted small" id="adStatus"></div>
+        </div>
+        <div class="mt-3">
+          <div class="muted small mb-1">Status do último ciclo</div>
+          <div id="adCycleStatus" class="small muted">Carregando…</div>
+        </div>
+      </div>
+
+      <hr class="divider">
+
+      <hr class="divider">
+      <div class="muted small">Atalhos</div>
+      <ul class="mb-0 small">
+        <li><a href="/health">/health</a></li>
+        <li><code>/poll/run-once</code> (GET/POST)</li>
+      </ul>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const status = (t) => { $("status").textContent = t || ""; };
+
+      function esc(s){ return (""+s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+      async function api(path, opts){
+        const r = await fetch(path, opts || {});
+        const j = await r.json().catch(()=>({ok:false,error:"Resposta inválida"}));
+        if(!r.ok){ throw new Error((j && (j.error||j.message)) || ("HTTP "+r.status)); }
+        return j;
+      }
+
+
+      async function loadDiscoverConfig(){
+        try{
+          const j = await api("/admin/discover");
+          $("adEnabled").checked = !!j.auto_discover_enabled;
+          $("adInterval").value = j.discover_interval_seconds ?? "";
+          $("adLimit").value = j.discover_limit_per_doc ?? "";
+          $("adMaxDocs").value = j.discover_max_docs_per_cycle ?? "";
+          $("adOnlyNoLinks").checked = !!j.discover_only_if_no_links;
+          $("adStatus").textContent = "Config carregada.";
+        }catch(e){
+          $("adStatus").textContent = "Falha ao carregar: " + e.message;
+        }
+      }
+
+      async function saveDiscoverConfig(){
+        const payload = {
+          enabled: $("adEnabled").checked,
+          discover_interval_seconds: Number($("adInterval").value || 0),
+          discover_limit_per_doc: Number($("adLimit").value || 0),
+          discover_max_docs_per_cycle: Number($("adMaxDocs").value || 0),
+          discover_only_if_no_links: $("adOnlyNoLinks").checked
+        };
+        $("adStatus").textContent = "Salvando…";
+        try{
+          const j = await api("/admin/discover", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify(payload)
+          });
+          $("adStatus").textContent = "Salvo. Ativo=" + (j.auto_discover_enabled ? "sim" : "não");
+        }catch(e){
+          $("adStatus").textContent = "Falha ao salvar: " + e.message;
+        }
+      }
+
+
+      function fmtTotals(t){
+        if(!t) return "";
+        return `docs=${t.docs} ran=${t.ran_docs} skipped=${t.skipped} discovered=${t.discovered} inserted=${t.inserted_processos} linked=${t.linked} errors=${t.errors}`;
+      }
+
+      async function loadDiscoverStatus(){
+        try{
+          const j = await api("/admin/discover/status");
+          const st = j.state || {};
+          let html = "";
+          if(st.running){
+            html += `<div><span class="spinner-border spinner-border-sm me-2"></span><b>Rodando agora</b> (${esc(st.last_trigger||"")})</div>`;
+          }else{
+            html += `<div><b>Parado</b></div>`;
+          }
+          if(st.last_started) html += `<div class="muted small">Início: ${esc(st.last_started)}</div>`;
+          if(st.last_finished) html += `<div class="muted small">Fim: ${esc(st.last_finished)}</div>`;
+          if(st.last_totals) html += `<div class="mt-1 mono small">${esc(fmtTotals(st.last_totals))}</div>`;
+          if(st.last_error) html += `<div class="text-warning small mt-1">Erro: ${esc(st.last_error)}</div>`;
+          $("adCycleStatus").innerHTML = html || '<span class="muted">Sem execuções ainda.</span>';
+        }catch(e){
+          $("adCycleStatus").textContent = "Falha ao carregar status: " + e.message;
+        }
+      }
+
+      async function runDiscoverNow(){
+        $("adStatus").textContent = "Disparando ciclo…";
+        try{
+          await api("/admin/discover/run-once", { method: "POST" });
+          $("adStatus").textContent = "Ciclo iniciado ✅";
+          await loadDiscoverStatus();
+        }catch(e){
+          $("adStatus").textContent = "Não foi possível iniciar: " + e.message;
+        }
+      }
+
+      async function loadWatchlist(){
+        const j = await api("/watchlist");
+        const items = j.items || [];
+        if(!items.length){
+          $("wl").innerHTML = '<div class="muted">Nenhum doc cadastrado.</div>';
+          return;
+        }
+
+        let html = '';
+        for(const it of items){
+          const doc = it.doc;
+          html += `
+            <div class="card p-2 mb-2">
+              <div class="d-flex justify-content-between align-items-start">
+                <div>
+                  <div><b>${esc(doc)}</b> <span class="muted">(${esc(it.tipo_doc)})</span></div>
+                  <div class="muted small">Criado em: ${esc(fmtDt(it.created_at))}</div>
+                </div>
+                <div class="d-flex gap-2">
+                  <button class="btn btn-sm btn-outline-primary" onclick="discover('${esc(doc)}')">Descobrir</button>
+                  <button class="btn btn-sm btn-outline-secondary" onclick="ack('${esc(doc)}')">Zerar alertas</button>
+                </div>
+              </div>
+
+              <div class="row mt-2">
+                <div class="col-md-7">
+                  <div class="muted small mb-1">Processos vinculados</div>
+                  <div id="p_${esc(doc)}" class="small muted">Carregando…</div>
+                </div>
+                <div class="col-md-5">
+                  <div class="muted small mb-1">Alertas</div>
+                  <div id="a_${esc(doc)}" class="small muted">Carregando…</div>
+                </div>
+              </div>
+            </div>
+          `;
+        }
+        $("wl").innerHTML = html;
+
+        // carregar detalhes (processos + alertas)
+        for(const it of items){
+          await refreshDoc(it.doc);
+        }
+      }
+
+      async function refreshDoc(doc){
+        try{
+          const pj = await api(`/docs/${encodeURIComponent(doc)}/processos`);
+          const aj = await api(`/docs/${encodeURIComponent(doc)}/alerts`);
+
+          const pEl = document.getElementById(`p_${doc}`);
+          const aEl = document.getElementById(`a_${doc}`);
+
+          const procs = pj.items || [];
+          if(!procs.length){
+            pEl.innerHTML = '<span class="muted">Nenhum vínculo ainda.</span>';
+          }else{
+            pEl.innerHTML = procs.map(x => `<a href="/ui/processo/${encodeURIComponent(x.cnj)}">${esc(x.cnj)}</a>`).join("<br>");
+          }
+
+          aEl.innerHTML = `
+            <div><b>${aj.new_events}</b> novos eventos</div>
+            <div class="muted small">last_event_id=${aj.last_event_id} | max_event_id=${aj.max_event_id}</div>
+          `;
+        }catch(e){
+          const pEl = document.getElementById(`p_${doc}`);
+          const aEl = document.getElementById(`a_${doc}`);
+          if(pEl) pEl.textContent = "Erro: " + e.message;
+          if(aEl) aEl.textContent = "Erro: " + e.message;
+        }
+      }
+
+      window.discover = async (doc) => {
+        status("Descobrindo processos…");
+        try{
+          const j = await api(`/docs/${encodeURIComponent(doc)}/discover`, {method:"POST"});
+          status(`OK: descobertos=${j.discovered}, novos_processos=${j.inserted_processos}, vinculados=${(j.linked||[]).length}`);
+          await refreshDoc(doc);
+        }catch(e){
+          status("Erro ao descobrir: " + e.message);
+        }
+      };
+
+      window.ack = async (doc) => {
+        status("Zerando alertas…");
+        try{
+          const j = await api(`/docs/${encodeURIComponent(doc)}/alerts/ack`, {method:"POST"});
+          status(`Alertas zerados até event_id=${j.acked_to_event_id}`);
+          await refreshDoc(doc);
+        }catch(e){
+          status("Erro ao zerar: " + e.message);
+        }
+      };
+
+      $("btnAdd").addEventListener("click", async () => {
+        const doc = $("docInput").value.trim();
+        if(!doc){ status("Informe um CPF/CNPJ."); return; }
+        status("Adicionando…");
+        try{
+          const r = await api("/watchlist", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({doc})});
+          status("Adicionado. Agora clique em “Descobrir”.");
+          $("docInput").value = "";
+          await loadWatchlist();
+        }catch(e){
+          status("Erro ao adicionar: " + e.message);
+        }
+      });
+
+      $("btnSaveDiscover").addEventListener("click", async ()=>{ await saveDiscoverConfig(); });
+      $("btnReloadDiscover").addEventListener("click", async ()=>{ await loadDiscoverConfig(); });
+$("btnRunDiscover").addEventListener("click", async ()=>{ await runDiscoverNow(); });
+
+      loadDiscoverConfig();
+      loadDiscoverStatus();
+      setInterval(loadDiscoverStatus, 5000);
+      loadWatchlist();
+    </script>
+    """
+    return render_template_string(UI_BASE, body=body)
+
+
+# ============================================================
+# Main
+# ===============================
+
+@app.get("/ui/watchlist")
+def ui_watchlist():
+    body = r"""
+    <div class="card p-3">
+      <div class="h5 mb-1">Watch-List</div>
+      <div class="muted">Gerencie CPF/CNPJ monitorados, descubra CNJs e visualize processos associados.</div>
+
+      <hr class="divider">
+
+      <div class="row g-2 align-items-end">
+        <div class="col-md-4">
+          <label class="form-label small muted">Adicionar doc (CPF/CNPJ)</label>
+          <input id="docInput" class="form-control" placeholder="000.000.000-00 ou 00.000.000/0000-00">
+        </div>
+        <div class="col-md-2">
+          <button id="btnAdd" class="btn btn-primary w-100">Adicionar</button>
+        </div>
+        <div class="col-md-6">
+          <div class="muted small">Dica: o botão “Descobrir” usa a rota <code>/envolvido/processos</code> da API v2 do Escavador.</div>
+          <div id="status" class="muted small mt-1"></div>
+        </div>
+      </div>
+
+      <hr class="divider">
+
+      <div class="muted small mb-1">Watchlist</div>
+      <div id="wl" class="small">Carregando…</div>
+
+      <div class="row g-2 mt-3 align-items-end">
+        <div class="col-md-6">
+          <label class="form-label small muted">Procurar</label>
+          <input id="wlSearch" class="form-control" placeholder="digite parte do CPF/CNPJ…">
+        </div>
+        <div class="col-md-2">
+          <button id="btnReloadWl" class="btn btn-outline-primary w-100">Recarregar</button>
+        </div>
+        <div class="col-md-4 text-md-end">
+          <span class="muted small">Clique em um doc para ver processos vinculados.</span>
+        </div>
+      </div>
+
+      <div class="accordion mt-3" id="wlAcc"></div>
+
+    </div>
+
+    <script>
+      async function apiJson(url, opts){
+        const r = await fetch(url, opts || {});
+        const t = await r.text();
+        let j = null;
+        try { j = JSON.parse(t); } catch(e) { j = { ok:false, error:"Resposta inválida", raw:t }; }
+        if(!r.ok) throw new Error((j && (j.error||j.message)) || ("HTTP "+r.status));
+        return j;
+      }
+
+      function esc(s){ return String(s||"").replace(/[&<>"']/g, (c)=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[c])); }
+
+      function normalizeDoc(s){ return String(s||"").trim(); }
+
+      async function loadWatchlist(){
+        const wlDiv = document.getElementById("wl");
+        const acc = document.getElementById("wlAcc");
+        wlDiv.textContent = "Carregando…";
+        acc.innerHTML = "";
+        try{
+          const wl = await apiJson("/watchlist");
+          const docs = (wl && wl.items) ? wl.items : (wl || []);
+          wlDiv.textContent = `${docs.length} doc(s)`;
+          window.__wl_docs = docs;
+          renderAcc();
+        }catch(e){
+          wlDiv.innerHTML = `<span class="text-danger">Falha: ${esc(e.message)}</span>`;
+        }
+      }
+
+      function renderAcc(){
+        const acc = document.getElementById("wlAcc");
+        const q = (document.getElementById("wlSearch").value||"").trim();
+        const docs = (window.__wl_docs||[]).filter(d => !q || String(d.doc||"").includes(q));
+        acc.innerHTML = "";
+        docs.forEach((d, idx)=>{
+          const doc = d.doc;
+          const hid = "wlH"+idx;
+          const cid = "wlC"+idx;
+          acc.insertAdjacentHTML("beforeend", `
+            <div class="accordion-item">
+              <h2 class="accordion-header" id="${hid}">
+                <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#${cid}" aria-expanded="false" aria-controls="${cid}">
+                  <span class="fw-semibold">${esc(doc)}</span>
+                  <span class="ms-2 badge text-bg-light">${esc(d.tipo_doc||"")}</span>
+                </button>
+              </h2>
+              <div id="${cid}" class="accordion-collapse collapse" aria-labelledby="${hid}" data-bs-parent="#wlAcc">
+                <div class="accordion-body">
+                  <div class="d-flex flex-wrap gap-2 mb-2">
+                    <button class="btn btn-sm btn-primary" data-action="discover" data-doc="${esc(doc)}">Descobrir</button>
+                    <button class="btn btn-sm btn-outline-primary" data-action="refresh" data-doc="${esc(doc)}">Atualizar lista</button>
+                  </div>
+                  <div class="small muted mb-1">Processos vinculados</div>
+                  <div class="small" data-procs="${esc(doc)}">Carregando…</div>
+                </div>
+              </div>
+            </div>
+          `);
+        });
+        // attach events
+        acc.querySelectorAll('[data-action="discover"]').forEach(btn=>{
+          btn.addEventListener("click", async ()=>{
+            const doc = btn.getAttribute("data-doc");
+            btn.disabled=true;
+            try{
+              await apiJson(`/docs/${encodeURIComponent(doc)}/discover`, {method:"POST"});
+              if(window.showToast) showToast("success","Discover","Processos descobertos/vinculados.");
+              await loadDocProcs(doc);
+            }catch(e){
+              if(window.showToast) showToast("danger","Discover falhou", e.message);
+            }finally{ btn.disabled=false; }
+          });
+        });
+        acc.querySelectorAll('[data-action="refresh"]').forEach(btn=>{
+          btn.addEventListener("click", async ()=>{
+            const doc = btn.getAttribute("data-doc");
+            await loadDocProcs(doc);
+          });
+        });
+        // lazy load procs on expand
+        acc.querySelectorAll(".accordion-collapse").forEach(col=>{
+          col.addEventListener("shown.bs.collapse", async ()=>{
+            const body = col.querySelector("[data-procs]");
+            const doc = body.getAttribute("data-procs");
+            await loadDocProcs(doc);
+          });
+        });
+      }
+
+      async function loadDocProcs(doc){
+        const el = document.querySelector(`[data-procs="${CSS.escape(doc)}"]`);
+        if(!el) return;
+        el.textContent = "Carregando…";
+        try{
+          const j = await apiJson(`/docs/${encodeURIComponent(doc)}/processos`);
+          const items = (j && j.items) ? j.items : (j || []);
+          if(!items.length){
+            el.innerHTML = `<span class="muted">Nenhum processo vinculado.</span>`;
+            return;
+          }
+          el.innerHTML = items.map(p=>{
+            const cnj = (p.cnj||p);
+            return `<a class="chip me-1 mb-1 d-inline-flex" href="/ui/processo/${encodeURIComponent(cnj)}">${esc(cnj)}</a>`;
+          }).join(" ");
+        }catch(e){
+          el.innerHTML = `<span class="text-danger">Falha: ${esc(e.message)}</span>`;
+        }
+      }
+
+      document.getElementById("btnReloadWl").addEventListener("click", loadWatchlist);
+      document.getElementById("wlSearch").addEventListener("input", ()=>renderAcc());
+
+      document.getElementById("btnAdd").addEventListener("click", async ()=>{
+        const doc = normalizeDoc(document.getElementById("docInput").value);
+        const status = document.getElementById("status");
+        status.textContent = "";
+        if(!doc){ status.textContent="Informe um CPF/CNPJ."; return; }
+        try{
+          await apiJson("/watchlist", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({doc})});
+          if(window.showToast) showToast("success","Watch-List","Doc adicionado.");
+          document.getElementById("docInput").value="";
+          await loadWatchlist();
+        }catch(e){
+          if(window.showToast) showToast("danger","Falha ao adicionar", e.message);
+        }
+      });
+
+      loadWatchlist();
+    </script>
+
+
+      """
+    return render_template_string(UI_BASE, body=body)
+
+def start_background_tasks():
+    # Polling loop (callbacks + inbox processing)
+    if POLL_INTERVAL_SECONDS > 0 and ESCAVADOR_TOKEN:
+        t1 = threading.Thread(target=poll_callbacks_loop, args=(client,), daemon=True)  # type: ignore
+        t1.start()
+    else:
+        if POLL_INTERVAL_SECONDS <= 0:
+            logger.info("Polling desabilitado (POLL_INTERVAL_SECONDS<=0).")
+        if not ESCAVADOR_TOKEN:
+            logger.info("Polling não iniciado: ESCAVADOR_TOKEN ausente.")
+
+    # Auto-discover loop (watchlist -> processes linking)
+    if client is not None and DISCOVER_INTERVAL_SECONDS > 0:
+        t2 = threading.Thread(target=auto_discover_loop, args=(client,), daemon=True)  # type: ignore
+        t2.start()
+    else:
+        if DISCOVER_INTERVAL_SECONDS <= 0:
+            logger.info("Auto-discover desabilitado (DISCOVER_INTERVAL_SECONDS<=0).")
+        if client is None:
+            logger.info("Auto-discover não iniciado: client indisponível (token ausente).")
+
+
+# ---------------------------
+# Dashboard Executivo (UI)
+# ---------------------------
+
+@app.get("/ui/api/dashboard/metrics")
+def ui_api_dashboard_metrics():
+    """Métricas agregadas (global) e por doc (CPF/CNPJ) para o dashboard.
+    Resiliente a bases antigas (tabelas/colunas ainda não criadas).
+    Query param opcional: ?doc=<cpf_cnpj>
+    """
+    doc_filter = (request.args.get("doc") or "").strip()
+    scope = (request.args.get("scope") or "").strip().lower()
+    if scope == "global":
+        doc_filter = ""
+
+    def _safe_err(msg: str):
+        logger.exception(msg)
+
+    def _row_count(cur: sqlite3.Cursor, sql: str, params: tuple = ()) -> int:
+        cur.execute(sql, params)
+        r = cur.fetchone()
+        if r is None:
+            return 0
+        if isinstance(r, sqlite3.Row):
+            return int(r[0] or 0)
+        return int(r[0] or 0)
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            def table_exists(name: str) -> bool:
+                cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,))
+                return cur.fetchone() is not None
+
+            def col_exists(table: str, col: str) -> bool:
+                try:
+                    cur.execute(f"PRAGMA table_info({table})")
+                    cols = [r[1] for r in cur.fetchall()]
+                    return col in cols
+                except Exception:
+                    return False
+
+            # -----------------------
+            # Lista de docs (watchlist)
+            # -----------------------
+            docs_list: list[str] = []
+            if table_exists("watchlist") and col_exists("watchlist", "doc"):
+                try:
+                    cur.execute("SELECT doc FROM watchlist ORDER BY doc")
+                    docs_list = [r[0] for r in cur.fetchall() if r[0]]
+                except Exception:
+                    docs_list = []
+
+            # -----------------------
+            # Métricas base (global)
+            # -----------------------
+            docs_total = _row_count(cur, "SELECT COUNT(*) FROM watchlist") if table_exists("watchlist") else 0
+            processos_total = _row_count(cur, "SELECT COUNT(*) FROM processos") if table_exists("processos") else 0
+            movs_total = _row_count(cur, "SELECT COUNT(*) FROM eventos_mov") if table_exists("eventos_mov") else 0
+
+            # Alertas pendentes: esquema legado alert_state(doc,last_event_id)
+            alertas_total = 0
+            if table_exists("eventos_mov") and table_exists("doc_process") and col_exists("doc_process", "doc") and col_exists("doc_process", "cnj"):
+                if table_exists("alert_state") and col_exists("alert_state", "doc") and col_exists("alert_state", "last_event_id"):
+                    try:
+                        alertas_total = _row_count(cur, """
+                            SELECT COUNT(*) 
+                            FROM eventos_mov e
+                            JOIN doc_process dp ON dp.cnj = e.cnj
+                            LEFT JOIN alert_state a ON a.doc = dp.doc
+                            WHERE e.id > COALESCE(a.last_event_id, 0)
+                        """)
+                    except sqlite3.OperationalError:
+                        alertas_total = 0
+                else:
+                    # Sem tabela de ACK: assume tudo como "novo" (mas apenas o que está vinculado a algum doc)
+                    try:
+                        alertas_total = _row_count(cur, """
+                            SELECT COUNT(*)
+                            FROM eventos_mov e
+                            JOIN doc_process dp ON dp.cnj = e.cnj
+                        """)
+                    except sqlite3.OperationalError:
+                        alertas_total = movs_total
+            else:
+                alertas_total = movs_total
+
+            
+            
+            # Custos (estimados) globais
+            cost_today_brl = 0.0
+            cost_month_brl = 0.0
+            if table_exists("api_usage"):
+                try:
+                    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    cur.execute("SELECT COALESCE(SUM(cost_brl),0) FROM api_usage WHERE substr(ts,1,10)=?", (today,))
+                    cost_today_brl = float(cur.fetchone()[0] or 0.0)
+                    month = datetime.now(timezone.utc).strftime("%Y-%m")
+                    cur.execute("SELECT COALESCE(SUM(cost_brl),0) FROM api_usage WHERE substr(ts,1,7)=?", (month,))
+                    cost_month_brl = float(cur.fetchone()[0] or 0.0)
+                except Exception:
+                    cost_today_brl, cost_month_brl = 0.0, 0.0
+
+            # Custos (reais) globais (importados do extrato)
+            cost_real_today_brl = 0.0
+            cost_real_month_brl = 0.0
+            if table_exists("api_usage_real"):
+                try:
+                    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    cur.execute("SELECT COALESCE(SUM(cost_brl),0) FROM api_usage_real WHERE substr(ts,1,10)=?", (today,))
+                    cost_real_today_brl = float(cur.fetchone()[0] or 0.0)
+                    month = datetime.now(timezone.utc).strftime("%Y-%m")
+                    cur.execute("SELECT COALESCE(SUM(cost_brl),0) FROM api_usage_real WHERE substr(ts,1,7)=?", (month,))
+                    cost_real_month_brl = float(cur.fetchone()[0] or 0.0)
+                except Exception:
+                    cost_real_today_brl, cost_real_month_brl = 0.0, 0.0
+
+            cost_delta_today_brl = cost_real_today_brl - cost_today_brl
+            cost_delta_month_brl = cost_real_month_brl - cost_month_brl
+
+            # Top CNJs por alertas pendentes (aprox.: pode contar duplicado se CNJ vinculado a múltiplos docs)
+            top_cnj_alerts = []
+            try:
+                if table_exists("eventos_mov") and table_exists("doc_process") and col_exists("doc_process", "doc") and col_exists("doc_process", "cnj") and col_exists("eventos_mov", "cnj"):
+                    if doc_filter:
+                        # Top CNJs somente do doc
+                        if table_exists("alert_state") and col_exists("alert_state", "doc") and col_exists("alert_state", "last_event_id"):
+                            cur.execute("""
+                                SELECT e.cnj AS cnj, COUNT(*) AS c
+                                FROM eventos_mov e
+                                JOIN doc_process dp ON dp.cnj = e.cnj
+                                LEFT JOIN alert_state a ON a.doc = dp.doc
+                                WHERE dp.doc=? AND e.id > COALESCE(a.last_event_id, 0)
+                                GROUP BY e.cnj
+                                ORDER BY c DESC
+                                LIMIT 5
+                            """, (doc_filter,))
+                        else:
+                            cur.execute("""
+                                SELECT e.cnj AS cnj, COUNT(*) AS c
+                                FROM eventos_mov e
+                                JOIN doc_process dp ON dp.cnj = e.cnj
+                                WHERE dp.doc=?
+                                GROUP BY e.cnj
+                                ORDER BY c DESC
+                                LIMIT 5
+                            """, (doc_filter,))
+                    else:
+                        if table_exists("alert_state") and col_exists("alert_state", "doc") and col_exists("alert_state", "last_event_id"):
+                            cur.execute("""
+                                SELECT e.cnj AS cnj, COUNT(*) AS c
+                                FROM eventos_mov e
+                                JOIN doc_process dp ON dp.cnj = e.cnj
+                                LEFT JOIN alert_state a ON a.doc = dp.doc
+                                WHERE e.id > COALESCE(a.last_event_id, 0)
+                                GROUP BY e.cnj
+                                ORDER BY c DESC
+                                LIMIT 5
+                            """)
+                        else:
+                            cur.execute("""
+                                SELECT e.cnj AS cnj, COUNT(*) AS c
+                                FROM eventos_mov e
+                                JOIN doc_process dp ON dp.cnj = e.cnj
+                                GROUP BY e.cnj
+                                ORDER BY c DESC
+                                LIMIT 5
+                            """)
+                    top_cnj_alerts = [{"cnj": r["cnj"], "count": int(r["c"])} for r in cur.fetchall()]
+            except Exception:
+                top_cnj_alerts = []
+# -----------------------
+            # Métricas por doc (opcional)
+            # -----------------------
+            per_doc = None
+            if doc_filter:
+                doc = doc_filter
+                processos_doc = 0
+                movs_doc = 0
+                alertas_doc = 0
+
+                if table_exists("doc_process") and col_exists("doc_process", "doc") and col_exists("doc_process", "cnj"):
+                    try:
+                        processos_doc = _row_count(cur, "SELECT COUNT(DISTINCT cnj) FROM doc_process WHERE doc=?", (doc,))
+                    except sqlite3.OperationalError:
+                        processos_doc = 0
+
+                    if table_exists("eventos_mov") and col_exists("eventos_mov", "cnj"):
+                        try:
+                            movs_doc = _row_count(cur, """
+                                SELECT COUNT(*)
+                                FROM eventos_mov e
+                                JOIN doc_process dp ON dp.cnj = e.cnj
+                                WHERE dp.doc=?
+                            """, (doc,))
+                        except sqlite3.OperationalError:
+                            movs_doc = 0
+
+                        if table_exists("alert_state") and col_exists("alert_state", "doc") and col_exists("alert_state", "last_event_id"):
+                            try:
+                                alertas_doc = _row_count(cur, """
+                                    SELECT COUNT(*)
+                                    FROM eventos_mov e
+                                    JOIN doc_process dp ON dp.cnj = e.cnj
+                                    LEFT JOIN alert_state a ON a.doc = dp.doc
+                                    WHERE dp.doc=? AND e.id > COALESCE(a.last_event_id, 0)
+                                """, (doc,))
+                            except sqlite3.OperationalError:
+                                alertas_doc = 0
+                        else:
+                            alertas_doc = movs_doc
+
+                # Custos (estimados) por doc
+                cost_doc_today = 0.0
+                cost_doc_month = 0.0
+                if table_exists("api_usage"):
+                    try:
+                        # hoje (UTC)
+                        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        cur.execute("SELECT COALESCE(SUM(cost_brl),0) FROM api_usage WHERE doc=? AND substr(ts,1,10)=?", (doc, today))
+                        cost_doc_today = float(cur.fetchone()[0] or 0.0)
+                        month = datetime.now(timezone.utc).strftime("%Y-%m")
+                        cur.execute("SELECT COALESCE(SUM(cost_brl),0) FROM api_usage WHERE doc=? AND substr(ts,1,7)=?", (doc, month))
+                        cost_doc_month = float(cur.fetchone()[0] or 0.0)
+                    except Exception:
+                        cost_doc_today, cost_doc_month = 0.0, 0.0
+
+                
+                # Custos (reais) por doc (importados do extrato)
+                cost_doc_real_today = 0.0
+                cost_doc_real_month = 0.0
+                if table_exists("api_usage_real"):
+                    try:
+                        today_s = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        cur.execute("SELECT COALESCE(SUM(cost_brl),0) FROM api_usage_real WHERE doc=? AND substr(ts,1,10)=?", (doc, today_s))
+                        cost_doc_real_today = float(cur.fetchone()[0] or 0.0)
+                        month_s = datetime.now(timezone.utc).strftime("%Y-%m")
+                        cur.execute("SELECT COALESCE(SUM(cost_brl),0) FROM api_usage_real WHERE doc=? AND substr(ts,1,7)=?", (doc, month_s))
+                        cost_doc_real_month = float(cur.fetchone()[0] or 0.0)
+                    except Exception:
+                        cost_doc_real_today, cost_doc_real_month = 0.0, 0.0
+
+                cost_doc_delta_today = cost_doc_real_today - cost_doc_today
+                cost_doc_delta_month = cost_doc_real_month - cost_doc_month
+
+                per_doc = {
+                    "doc": doc,
+                    "processos": processos_doc,
+                    "movs": movs_doc,
+                    "alertas": alertas_doc,
+                    "cost_today_brl": round(cost_doc_today, 2),
+                    "cost_month_brl": round(cost_doc_month, 2),
+                    "cost_real_today_brl": round(cost_doc_real_today, 2),
+                    "cost_real_month_brl": round(cost_doc_real_month, 2),
+                    "cost_delta_today_brl": round(cost_doc_delta_today, 2),
+                    "cost_delta_month_brl": round(cost_doc_delta_month, 2),
+                }
+
+            # -----------------------
+            # Tabela resumo por doc (leve)
+            # -----------------------
+            docs_summary: list[dict] = []
+            if docs_list and table_exists("doc_process") and col_exists("doc_process", "doc") and col_exists("doc_process", "cnj"):
+                for d in docs_list[:50]:
+                    try:
+                        pcount = _row_count(cur, "SELECT COUNT(DISTINCT cnj) FROM doc_process WHERE doc=?", (d,))
+                    except Exception:
+                        pcount = 0
+                    acount = 0
+                    if table_exists("eventos_mov") and col_exists("eventos_mov", "cnj"):
+                        if table_exists("alert_state") and col_exists("alert_state", "doc") and col_exists("alert_state", "last_event_id"):
+                            try:
+                                acount = _row_count(cur, """
+                                    SELECT COUNT(*)
+                                    FROM eventos_mov e
+                                    JOIN doc_process dp ON dp.cnj = e.cnj
+                                    LEFT JOIN alert_state a ON a.doc = dp.doc
+                                    WHERE dp.doc=? AND e.id > COALESCE(a.last_event_id, 0)
+                                """, (d,))
+                            except Exception:
+                                acount = 0
+                        else:
+                            try:
+                                acount = _row_count(cur, """
+                                    SELECT COUNT(*)
+                                    FROM eventos_mov e
+                                    JOIN doc_process dp ON dp.cnj = e.cnj
+                                    WHERE dp.doc=?
+                                """, (d,))
+                            except Exception:
+                                acount = 0
+                    docs_summary.append({"doc": d, "processos": pcount, "alertas": acount})
+
+            
+            # Top docs por alertas (para o dashboard)
+            try:
+                top_docs_alerts = sorted(
+                    docs_summary,
+                    key=lambda x: int(x.get("alertas") or 0),
+                    reverse=True,
+                )[:5]
+            except Exception:
+                top_docs_alerts = []
+            return jsonify({
+                "ok": True,
+                "docs": docs_total,
+                "processos": processos_total,
+                "movs": movs_total,
+                "alertas": alertas_total,
+                "alertas_global": alertas_total,
+                "cost_today_brl": round(cost_today_brl, 2),
+                "cost_month_brl": round(cost_month_brl, 2),
+                "cost_real_today_brl": round(cost_real_today_brl, 2),
+                "cost_real_month_brl": round(cost_real_month_brl, 2),
+                "cost_delta_today_brl": round(cost_delta_today_brl, 2),
+                "cost_delta_month_brl": round(cost_delta_month_brl, 2),
+                "top_cnj_alerts": top_cnj_alerts,
+                "top_docs_alerts": top_docs_alerts,
+                "docs_list": docs_list,
+                "docs_summary": docs_summary,
+                "per_doc": per_doc,
+                "poll_state": _get_poll_state(),
+                "discover_state": _get_discover_state(),
+                "last_api_error": _get_last_api_error(),
+            })
+    except Exception:
+        _safe_err("Dashboard: falha ao calcular métricas")
+        return jsonify({"ok": False, "error": "Falha ao calcular métricas"}), 200
+
+
+@app.get("/ui/api/costs/summary")
+def ui_api_costs_summary():
+    """Resumo de custos (estimado x real) para dashboard. Opcional: ?doc=<CPF/CNPJ>."""
+    doc = request.args.get("doc")
+    now = datetime.now(timezone.utc)
+    day0 = datetime(now.year, now.month, now.day, tzinfo=timezone.utc).isoformat()
+    mon0 = datetime(now.year, now.month, 1, tzinfo=timezone.utc).isoformat()
+
+    def _sum(table: str, col: str) -> tuple[float, float]:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            # tabela pode não existir em bases antigas
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
+            if cur.fetchone() is None:
+                return 0.0, 0.0
+            if doc:
+                cur.execute(f"SELECT COALESCE(SUM({col}),0) AS s FROM {table} WHERE ts>=? AND doc=?", (day0, doc))
+                today = float(cur.fetchone()["s"] or 0.0)
+                cur.execute(f"SELECT COALESCE(SUM({col}),0) AS s FROM {table} WHERE ts>=? AND doc=?", (mon0, doc))
+                month = float(cur.fetchone()["s"] or 0.0)
+            else:
+                cur.execute(f"SELECT COALESCE(SUM({col}),0) AS s FROM {table} WHERE ts>=?", (day0,))
+                today = float(cur.fetchone()["s"] or 0.0)
+                cur.execute(f"SELECT COALESCE(SUM({col}),0) AS s FROM {table} WHERE ts>=?", (mon0,))
+                month = float(cur.fetchone()["s"] or 0.0)
+            return today, month
+
+    real_today, real_month = _sum("api_usage_real", "cost_brl")
+    est_today, est_month = _sum("api_usage_est", "cost_brl")
+
+    return jsonify({
+        "ok": True,
+        "doc": doc,
+        "real": {"today": real_today, "month": real_month},
+        "est": {"today": est_today, "month": est_month},
+        "delta": {"today": real_today - est_today, "month": real_month - est_month},
+    })
+
+
+@app.get("/ui/api/costs/timeseries")
+def ui_api_costs_timeseries():
+    """Série diária de custos (real x est) para gráfico. Params: days=30, doc opcional."""
+    doc = request.args.get("doc")
+    try:
+        days = int(request.args.get("days") or 30)
+    except Exception:
+        days = 30
+    days = max(1, min(days, 365))
+    # Agrupa por dia UTC (YYYY-MM-DD)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        def _load(table: str, col: str) -> dict[str, float]:
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,))
+            if cur.fetchone() is None:
+                return {}
+            if doc:
+                cur.execute(
+                    f"""SELECT substr(ts,1,10) AS d, COALESCE(SUM({col}),0) AS s
+                         FROM {table}
+                         WHERE doc=? AND ts >= datetime('now','-{days} days')
+                         GROUP BY d ORDER BY d""",
+                    (doc,),
+                )
+            else:
+                cur.execute(
+                    f"""SELECT substr(ts,1,10) AS d, COALESCE(SUM({col}),0) AS s
+                         FROM {table}
+                         WHERE ts >= datetime('now','-{days} days')
+                         GROUP BY d ORDER BY d"""
+                )
+            return {r["d"]: float(r["s"] or 0.0) for r in cur.fetchall()}
+
+        real = _load("api_usage_real", "cost_brl")
+        est = _load("api_usage_est", "cost_brl")
+
+    # Monta eixo
+    # pega união de datas e completa faltantes
+    keys = sorted(set(real.keys()) | set(est.keys()))
+    labels = keys[-days:] if len(keys) > days else keys
+    return jsonify({
+        "ok": True,
+        "doc": doc,
+        "labels": labels,
+        "real": [real.get(d, 0.0) for d in labels],
+        "est": [est.get(d, 0.0) for d in labels],
+    })
+
+
+@app.get("/ui/api/dashboard/timeseries")
+def ui_api_dashboard_timeseries():
+    """Retorna série temporal (últimos N dias) de movimentações salvas.
+    Params:
+      - doc (opcional): filtra por CPF/CNPJ (via doc_process)
+      - days (opcional): default 14
+    """
+    try:
+        doc = (request.args.get("doc") or "").strip()
+        days = int(request.args.get("days") or "14")
+        days = max(3, min(days, 90))
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            # tabela existe?
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='eventos_mov'")
+            if not cur.fetchone():
+                return jsonify({"ok": True, "labels": [], "movs": []})
+
+            params: list[Any] = []
+            join = ""
+            where = "WHERE 1=1"
+            if doc:
+                # só filtra se tiver doc_process
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='doc_process'")
+                if cur.fetchone():
+                    join = "JOIN doc_process dp ON dp.cnj = e.cnj"
+                    where += " AND dp.doc=?"
+                    params.append(doc)
+
+            # janela
+            where += " AND e.created_at >= datetime('now', ?)"
+            params.append(f"-{days} days")
+
+            q = f"""
+                SELECT substr(e.created_at, 1, 10) AS d, COUNT(*) AS c
+                FROM eventos_mov e
+                {join}
+                {where}
+                GROUP BY substr(e.created_at, 1, 10)
+                ORDER BY d ASC
+            """
+            cur.execute(q, tuple(params))
+            rows = cur.fetchall()
+            labels = [r["d"] for r in rows]
+            movs = [int(r["c"]) for r in rows]
+
+        return jsonify({"ok": True, "labels": labels, "movs": movs, "days": days, "doc": doc or None})
+    except Exception as e:
+        logger.exception("Dashboard: falha ao calcular timeseries")
+        return jsonify({"ok": False, "error": str(e)}), 200
+
+
+@app.get("/ui/api/alerts")
+def ui_api_alerts_list():
+    """Lista alertas pendentes (eventos_mov não-ACKed) para o painel do dashboard.
+    Params (querystring):
+      - doc: opcional (CPF/CNPJ)
+      - limit: default 50 (max 500)
+      - types: lista separada por vírgula (ex: SENTENCA,DECISAO,PENHORA)
+      - must_value_penhora: 0/1 (quando 1, tenta filtrar por textos que indiquem valor/penhora/bloqueio)
+      - q: termo livre (contém em texto)
+    """
+    doc = (request.args.get("doc") or "").strip()
+    qterm = (request.args.get("q") or "").strip().lower()
+    types_raw = (request.args.get("types") or "").strip()
+    must_vp = (request.args.get("must_value_penhora") or "").strip() in ("1", "true", "True", "yes", "on")
+    try:
+        limit = int(request.args.get("limit") or "50")
+    except Exception:
+        limit = 50
+    limit = max(1, min(limit, 500))
+
+    types: list[str] = []
+    if types_raw:
+        types = [t.strip().upper() for t in types_raw.split(",") if t.strip()]
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        # valida tabelas mínimas
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='eventos_mov'")
+        if not cur.fetchone():
+            return jsonify({"ok": True, "items": [], "count": 0})
+
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='doc_process'")
+        if not cur.fetchone():
+            return jsonify({"ok": True, "items": [], "count": 0})
+
+        # alert_state é opcional (base antiga)
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='alert_state'")
+        has_ack = cur.fetchone() is not None
+
+        where = "WHERE 1=1"
+        params: list[Any] = []
+
+        if doc:
+            where += " AND dp.doc=?"
+            params.append(doc)
+
+        if has_ack:
+            where += " AND e.id > COALESCE(a.last_event_id, 0)"
+
+        if types:
+            placeholders = ",".join(["?"] * len(types))
+            where += f" AND UPPER(COALESCE(e.tipo_inferido,'')) IN ({placeholders})"
+            params.extend(types)
+
+        if qterm:
+            where += " AND LOWER(COALESCE(e.texto,'')) LIKE ?"
+            params.append(f"%{qterm}%")
+
+        if must_vp:
+            # Heurística simples (SQLite sem REGEXP padrão): palavras-chave e presença de R$
+            where += " AND (LOWER(COALESCE(e.texto,'')) LIKE '%penhor%' OR LOWER(COALESCE(e.texto,'')) LIKE '%bloque%' OR LOWER(COALESCE(e.texto,'')) LIKE '%bacen%' OR LOWER(COALESCE(e.texto,'')) LIKE '%sisba%' OR LOWER(COALESCE(e.texto,'')) LIKE '%r$%' OR LOWER(COALESCE(e.texto,'')) LIKE '%valor%' OR UPPER(COALESCE(e.tipo_inferido,''))='PENHORA')"
+
+        join_ack = "LEFT JOIN alert_state a ON a.doc = dp.doc" if has_ack else ""
+
+        sql = f"""
+            SELECT
+              dp.doc AS doc,
+              e.cnj AS cnj,
+              e.id AS event_id,
+              e.data AS data,
+              e.created_at AS created_at,
+              e.tipo AS tipo,
+              e.tipo_inferido AS tipo_inferido,
+              e.texto AS texto
+            FROM eventos_mov e
+            JOIN doc_process dp ON dp.cnj = e.cnj
+            {join_ack}
+            {where}
+            ORDER BY e.id DESC
+            LIMIT ?
+        """
+        cur.execute(sql, (*params, limit))
+        items = [dict(r) for r in cur.fetchall()]
+
+    return jsonify({"ok": True, "items": items, "count": len(items)})
+
+
+@app.get("/ui/api/alerts/export.csv")
+def ui_api_alerts_export_csv():
+    """Exporta os alertas do painel em CSV (mesmos filtros do /ui/api/alerts)."""
+    # reaproveita a listagem (sem duplicar SQL)
+    with app.test_request_context():
+        pass  # placeholder
+
+    # chama a função de listagem manualmente (sem HTTP)
+    # (duplicação mínima para manter simples e robusto)
+    doc = (request.args.get("doc") or "").strip()
+    qterm = (request.args.get("q") or "").strip().lower()
+    types_raw = (request.args.get("types") or "").strip()
+    must_vp = (request.args.get("must_value_penhora") or "").strip() in ("1", "true", "True", "yes", "on")
+    try:
+        limit = int(request.args.get("limit") or "500")
+    except Exception:
+        limit = 500
+    limit = max(1, min(limit, 2000))
+
+    types: list[str] = []
+    if types_raw:
+        types = [t.strip().upper() for t in types_raw.split(",") if t.strip()]
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='eventos_mov'")
+        if not cur.fetchone():
+            out = "doc,cnj,event_id,data,created_at,tipo,tipo_inferido,texto\n"
+            return Response(out, mimetype="text/csv; charset=utf-8")
+
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='doc_process'")
+        if not cur.fetchone():
+            out = "doc,cnj,event_id,data,created_at,tipo,tipo_inferido,texto\n"
+            return Response(out, mimetype="text/csv; charset=utf-8")
+
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='alert_state'")
+        has_ack = cur.fetchone() is not None
+
+        where = "WHERE 1=1"
+        params: list[Any] = []
+
+        if doc:
+            where += " AND dp.doc=?"
+            params.append(doc)
+
+        if has_ack:
+            where += " AND e.id > COALESCE(a.last_event_id, 0)"
+
+        if types:
+            placeholders = ",".join(["?"] * len(types))
+            where += f" AND UPPER(COALESCE(e.tipo_inferido,'')) IN ({placeholders})"
+            params.extend(types)
+
+        if qterm:
+            where += " AND LOWER(COALESCE(e.texto,'')) LIKE ?"
+            params.append(f"%{qterm}%")
+
+        if must_vp:
+            where += " AND (LOWER(COALESCE(e.texto,'')) LIKE '%penhor%' OR LOWER(COALESCE(e.texto,'')) LIKE '%bloque%' OR LOWER(COALESCE(e.texto,'')) LIKE '%bacen%' OR LOWER(COALESCE(e.texto,'')) LIKE '%sisba%' OR LOWER(COALESCE(e.texto,'')) LIKE '%r$%' OR LOWER(COALESCE(e.texto,'')) LIKE '%valor%' OR UPPER(COALESCE(e.tipo_inferido,''))='PENHORA')"
+
+        join_ack = "LEFT JOIN alert_state a ON a.doc = dp.doc" if has_ack else ""
+        sql = f"""
+            SELECT
+              dp.doc AS doc,
+              e.cnj AS cnj,
+              e.id AS event_id,
+              e.data AS data,
+              e.created_at AS created_at,
+              e.tipo AS tipo,
+              e.tipo_inferido AS tipo_inferido,
+              e.texto AS texto
+            FROM eventos_mov e
+            JOIN doc_process dp ON dp.cnj = e.cnj
+            {join_ack}
+            {where}
+            ORDER BY e.id DESC
+            LIMIT ?
+        """
+        cur.execute(sql, (*params, limit))
+        rows = cur.fetchall()
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["doc","cnj","event_id","data","created_at","tipo","tipo_inferido","texto"])
+    for r in rows:
+        w.writerow([
+            r["doc"] or "",
+            r["cnj"] or "",
+            r["event_id"] or "",
+            (r["data"] or ""),
+            (r["created_at"] or ""),
+            (r["tipo"] or ""),
+            (r["tipo_inferido"] or ""),
+            (r["texto"] or ""),
+        ])
+    out = buf.getvalue()
+    return Response(out, mimetype="text/csv; charset=utf-8")
+
+
+@app.get("/ui/dashboard")
+def ui_dashboard():
+    return redirect("/ui#dashboard")
+
+
+
+
+@app.get("/ui/costs")
+def ui_costs():
+    # Página para importar extrato (XLSX) e visualizar custos reais vs estimados
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        def table_exists(name: str) -> bool:
+            cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,))
+            return cur.fetchone() is not None
+
+        last_real = []
+        if table_exists("api_usage_real"):
+            try:
+                cur.execute("SELECT ts, imported_at, source, method, endpoint, doc, cnj, cost_brl FROM api_usage_real ORDER BY ts DESC LIMIT 25")
+                last_real = [dict(r) for r in cur.fetchall()]
+            except Exception:
+                last_real = []
+
+    rows_html = ""
+    if last_real:
+        for rr in last_real:
+            rows_html += (
+                "<tr>"
+                f"<td class='mono small'>{esc(str(rr.get('ts',''))[:19]).replace('T',' ')}</td>"
+                f"<td class='mono small'>{esc(str(rr.get('imported_at','') or '')[:19]).replace('T',' ')}</td>"
+                f"<td class='mono small'>{esc(rr.get('source','') or '')}</td>"
+                f"<td class='mono small'>{esc(rr.get('method',''))}</td>"
+                f"<td class='mono small wrap'>{esc(rr.get('endpoint',''))}</td>"
+                f"<td class='mono small'>{esc(rr.get('doc','') or '')}</td>"
+                f"<td class='mono small'>{esc(rr.get('cnj','') or '')}</td>"
+                f"<td class='text-end mono small'>R$ {float(rr.get('cost_brl') or 0.0):.2f}</td>"
+                "</tr>"
+            )
+    else:
+        rows_html = "<tr><td colspan='8' class='muted'>Nenhum extrato importado ainda.</td></tr>"
+
+    body = f"""
+    <div class="d-flex align-items-center justify-content-between mb-3">
+      <div>
+        <div class="h4 mb-0">Custos (Real x Estimado)</div>
+        <div class="muted small">Importe o XLSX do Escavador para preencher o custo <b>Real</b>. O custo <b>Estimado</b> vem do uso interno.</div>
+      </div>
+      <div class="d-flex gap-2">
+        <a class="btn btn-outline-secondary" href="/ui">Voltar</a>
+        <button class="btn btn-outline-danger" id="btnClearReal" type="button">Limpar histórico importado</button>
+      </div>
+    </div>
+
+    <div id="importMsg" class="mb-3"></div>
+
+    <div class="card p-3 mb-3">
+      <div class="h6 mb-2">Importar XLSX</div>
+      <form id="xlsxForm">
+        <div class="row g-2 align-items-end">
+          <div class="col-md-6">
+            <label class="form-label small muted">Arquivo XLSX (Relatório de Consumo da API)</label>
+            <input class="form-control" type="file" name="file" accept=".xlsx" required />
+          </div>
+          <div class="col-md-3">
+            <button class="btn btn-primary w-100" type="submit">Importar</button>
+          </div>
+          <div class="col-md-3">
+            <button class="btn btn-outline-secondary w-100" type="button" id="btnReload">Recarregar</button>
+          </div>
+        </div>
+        <div class="muted small mt-2">Dica: importar o mesmo arquivo novamente não duplica (dedupe automático).</div>
+      </form>
+    </div>
+
+    <div class="card p-3">
+      <div class="h6 mb-2">Últimos lançamentos importados (Real)</div>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle">
+          <thead>
+            <tr class="muted small">
+              <th>Utilização</th>
+              <th>Importado</th>
+              <th>Fonte</th>
+              <th>Método</th>
+              <th>Endpoint</th>
+              <th>Doc</th>
+              <th>CNJ</th>
+              <th class="text-end">Custo</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows_html}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <script>
+    function showMsg(kind, html){{
+      const el = document.getElementById('importMsg');
+      const cls = kind==='ok' ? 'alert alert-success' : 'alert alert-danger';
+      el.innerHTML = `<div class="${{cls}}">${{html}}</div>`;
+    }}
+
+    document.getElementById('btnReload').addEventListener('click', ()=>location.reload());
+
+    document.getElementById('xlsxForm').addEventListener('submit', async (e)=>{{
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      showMsg('ok', 'Importando...');
+
+      try {{
+        const r = await fetch('/admin/costs/import-xlsx', {{ method:'POST', body: fd }});
+        const j = await r.json();
+        if(!j.ok) {{
+          showMsg('err', 'Falha ao importar: ' + (j.error || 'erro desconhecido'));
+          return;
+        }}
+        showMsg('ok', `Importação concluída. Inseridos: <b>${{j.inserted}}</b> | Duplicados: <b>${{j.skipped}}</b> | Erros: <b>${{j.errors}}</b>`);
+        setTimeout(()=>location.reload(), 600);
+      }} catch(ex) {{
+        showMsg('err', 'Falha de rede ao importar: ' + ex);
+      }}
+    }});
+
+    document.getElementById('btnClearReal').addEventListener('click', async ()=>{{
+      if(!confirm('Tem certeza que deseja limpar TODO o histórico importado (custos reais)?')) return;
+      try {{
+        const r = await fetch('/admin/costs/clear-real', {{method:'POST'}});
+        const j = await r.json();
+        if(!j.ok) {{
+          showMsg('err', 'Falha ao limpar histórico: ' + (j.error || 'erro'));
+          return;
+        }}
+        showMsg('ok', 'Histórico importado limpo.');
+        setTimeout(()=>location.reload(), 400);
+      }} catch(ex) {{
+        showMsg('err', 'Falha de rede ao limpar: ' + ex);
+      }}
+    }});
+    </script>
+    """
+    return render_template_string(UI_BASE, body=body)
+
+
+@app.get("/ui/documentacao")
+def ui_documentacao():
+    md_path = pathlib.Path(__file__).parent / "DEPARA.md"
+    try:
+        md_text = md_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, UnicodeDecodeError) as exc:
+        md_text = f"# Erro ao carregar DEPARA.md\n\nArquivo esperado em `{md_path}`. Detalhe: {exc}"
+
+    content_html = _md_to_html(md_text)
+
+    body = f"""
+    <div class="mb-3 d-flex align-items-center justify-content-between flex-wrap gap-2">
+      <div>
+        <div class="muted small">Referência técnica</div>
+        <div class="h4 mb-0">Documentação do Monitor Jurídico</div>
+        <div class="muted small mt-1">Endpoints Escavador v2, métodos Python e precificação utilizados nesta aplicação.</div>
+      </div>
+      <button class="btn btn-outline-light btn-sm" onclick="baixarHTML()">⬇️ Baixar como HTML</button>
+    </div>
+    <div id="doc-content">
+      <div class="card p-4 mb-4">
+        <div class="h6 mb-3">📋 Endpoints e Precificação da API Escavador v2</div>
+        <div class="table-responsive">
+          <table class="table table-dark table-hover align-middle">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Funcionalidade</th>
+                <th>Endpoint Escavador v2</th>
+                <th>Método Python</th>
+                <th>Custo estimado</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>1</td>
+                <td><strong>Busca do CNPJ</strong> (Watchlist / Monitoramento)</td>
+                <td><code>POST /api/v2/monitoramentos/novos-processos</code></td>
+                <td>— (webhook recebido)</td>
+                <td>— (sem custo de chamada ativa)</td>
+              </tr>
+              <tr>
+                <td>2</td>
+                <td><strong>Busca de Processos por CNPJ</strong> (Discover)</td>
+                <td><code>GET /api/v2/envolvido/processos?cpf_cnpj=...</code></td>
+                <td><code>listar_processos_envolvido()</code></td>
+                <td>R$ 2,90 até 200 itens + R$ 0,05/200 adicionais</td>
+              </tr>
+              <tr>
+                <td>3</td>
+                <td><strong>Resumo</strong> (sidebar do processo)</td>
+                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}</code></td>
+                <td><code>obter_capa_processo()</code></td>
+                <td>R$ 0,04 (cache 1 dia)</td>
+              </tr>
+              <tr>
+                <td>4</td>
+                <td><strong>Capa</strong> do processo</td>
+                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}</code></td>
+                <td><code>obter_capa_processo()</code></td>
+                <td>R$ 0,04 (cache 1 dia)</td>
+              </tr>
+              <tr>
+                <td>5</td>
+                <td><strong>Partes</strong> (polo ativo/passivo)</td>
+                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}</code> — campo <code>envolvidos[]</code></td>
+                <td><code>obter_capa_processo()</code></td>
+                <td>— (mesmo JSON da Capa)</td>
+              </tr>
+              <tr>
+                <td>6</td>
+                <td><strong>Pedidos &amp; Multas</strong></td>
+                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}</code> — campos <code>pedidos</code> e <code>multas</code></td>
+                <td><code>obter_capa_processo()</code></td>
+                <td>— (mesmo JSON da Capa)</td>
+              </tr>
+              <tr>
+                <td>7</td>
+                <td><strong>Movimentações</strong></td>
+                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}/movimentacoes</code></td>
+                <td><code>listar_movimentacoes()</code></td>
+                <td>R$ 0,04 por chamada</td>
+              </tr>
+              <tr>
+                <td>8</td>
+                <td><strong>Documentações</strong> (docs públicos)</td>
+                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}/documentos-publicos</code></td>
+                <td><code>listar_documentos_publicos_v2()</code></td>
+                <td>R$ 0,04 + assíncrono (requer solicitar-atualizacao)</td>
+              </tr>
+              <tr>
+                <td>9</td>
+                <td><strong>Documentações</strong> (autos restritos)</td>
+                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}/autos</code></td>
+                <td><code>listar_autos_v2()</code></td>
+                <td>R$ 0,04 + certificado A1/A3</td>
+              </tr>
+              <tr>
+                <td>10</td>
+                <td><strong>Monitoramento</strong> (callbacks/webhook)</td>
+                <td>webhook <code>POST</code> recebido de <code>/api/v2/monitoramentos/novos-processos</code></td>
+                <td>rota <code>/webhook</code></td>
+                <td>— (sem custo de chamada ativa)</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card p-4">
+        <div class="h6 mb-3">🔁 De/Para — Blue Service BPM ↔ Escavador v2</div>
+        <div class="md-body">
+          {content_html}
+        </div>
+      </div>
+    </div>
+
+    <script>
+    function baixarHTML() {{
+      const inner = document.getElementById("doc-content").innerHTML;
+      const html = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Documentação do Monitor Jurídico</title>
+  <style>
+    body {{ background:#0b1220; color:#e6e6e6; font-family:sans-serif; padding:2rem; }}
+    table {{ width:100%; border-collapse:collapse; margin-bottom:1rem; font-size:.93rem; }}
+    th, td {{ border:1px solid #2a3550; padding:.45rem .7rem; text-align:left; }}
+    th {{ background:rgba(48,80,160,.2); font-weight:600; }}
+    tr:nth-child(even) td {{ background:rgba(255,255,255,.03); }}
+    code {{ background:rgba(48,80,160,.2); border-radius:5px; padding:.15rem .4rem; font-size:.9em; }}
+    pre {{ background:#0d1525; border:1px solid #2a3550; border-radius:10px; padding:1rem; overflow-x:auto; }}
+    h1,h2,h3 {{ color:#5b8cff; margin-top:1.4rem; margin-bottom:.5rem; }}
+    blockquote {{ border-left:3px solid #5b8cff; padding-left:1rem; color:#999; margin:.8rem 0; }}
+    hr {{ border-color:#2a3550; margin:1.5rem 0; }}
+  </style>
+</head>
+<body>
+${{inner}}
+</body>
+</html>`;
+      const blob = new Blob([html], {{type: "text/html"}});
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "documentacao_monitor_juridico.html";
+      a.click();
+    }}
+    </script>
+    """
+    return render_template_string(UI_BASE, body=body)
+
+if __name__ == "__main__":
+    start_background_tasks()
+    logger.info("Starting Flask on %s:%s (token=%s)", HOST, PORT, _mask(ESCAVADOR_TOKEN))
+    app.run(host=HOST, port=PORT)
