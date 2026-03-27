@@ -12,32 +12,13 @@ import threading
 import sqlite3
 import time
 import openpyxl
-from urllib.parse import urlparse, parse_qs, unquote_plus
+from urllib.parse import urlparse, parse_qs, unquote_plus, quote
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Tuple
 
-import pathlib
-
 import requests
 from flask import Flask, request, jsonify, abort, render_template_string, redirect, Response
-
-# ----------------------------
-# Markdown → HTML (with fallbacks)
-# ----------------------------
-try:
-    import markdown as _md
-    def _md_to_html(text: str) -> str:
-        return _md.markdown(text, extensions=["tables", "fenced_code"])
-except ImportError:
-    try:
-        import mistune
-        def _md_to_html(text: str) -> str:
-            return mistune.html(text)
-    except ImportError:
-        import html as _html_mod
-        def _md_to_html(text: str) -> str:
-            return "<pre class='wrap-any p-3'>" + _html_mod.escape(text) + "</pre>"
 
 # ----------------------------
 # Load .env (dev)
@@ -96,7 +77,7 @@ ESCAVADOR_BASE = os.getenv("ESCAVADOR_BASE", "https://api.escavador.com/api/v2")
 ESCAVADOR_TOKEN = os.getenv("ESCAVADOR_TOKEN", "").strip()
 WEBHOOK_AUTH_TOKEN = os.getenv("WEBHOOK_AUTH_TOKEN", "").strip()
 
-DB_PATH = os.getenv("DB_PATH", "./escavador_monitor.db")
+DB_PATH = os.getenv("DB_PATH", "./specter.db")
 DB_PATH_ABS = os.path.abspath(DB_PATH)
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 AUTO_DISCOVER_ENABLED = os.getenv("AUTO_DISCOVER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -279,12 +260,38 @@ def doc_type(doc: str) -> str:
     return "CNPJ" if len(digits) == 14 else "CPF"
 
 
+def normalize_cnj(value: str) -> str:
+    cnj = (value or "").strip()
+    digits = re.sub(r"\D", "", cnj)
+    if len(digits) != 20:
+        raise ValueError("CNJ inválido. Informe no padrão 0000000-00.0000.0.00.0000.")
+    if not re.match(r"^\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}$", cnj):
+        cnj = f"{digits[:7]}-{digits[7:9]}.{digits[9:13]}.{digits[13]}.{digits[14:16]}.{digits[16:20]}"
+    return cnj
+
+
 CNJ_REGEX = re.compile(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}")
 DOC_REGEX = re.compile(r"\b(\d{3}\.?\d{3}\.?\d{3}-?\d{2}|\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})\b")
 
 # ----------------------------
 # Escavador Client
 # ----------------------------
+class EscavadorAlreadyMonitored(Exception):
+    """Raised when Escavador reports the process is already being monitored."""
+
+
+class EscavadorUnauthorized(Exception):
+    """Raised when the token is not authorized for the requested endpoint."""
+
+
+class EscavadorUpdateAlreadyRunning(Exception):
+    """Raised when Escavador reports an update is already running for the process."""
+
+    def __init__(self, payload: Optional[Dict[str, Any]] = None, message: str = "Atualização já em andamento."):
+        super().__init__(message)
+        self.payload = payload or {}
+
+
 class EscavadorClient:
     def __init__(self, base: str, token: str):
         self.base = base.rstrip("/")
@@ -295,7 +302,7 @@ class EscavadorClient:
                 "X-Requested-With": "XMLHttpRequest",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "BlueService-EscavadorMonitor/4.3",
+                "User-Agent": "Specter/4.3",
             }
         )
 
@@ -334,6 +341,31 @@ class EscavadorClient:
                     if attempt < retries:
                         time.sleep(backoff_seconds * attempt)
                         continue
+
+                if r.status_code == 401:
+                    msg = (r.text or "").strip()[:600]
+                    logger.warning("Escavador %s %s unauthorized: %s", method, path, msg)
+                    _set_last_api_error(method, path, r.status_code, r.text)
+                    raise EscavadorUnauthorized(msg or f"401 Unauthorized em {path}")
+
+                if r.status_code == 422 and method.upper() == "POST" and path == "/monitoramentos/processos":
+                    body_txt = (r.text or "").lower()
+                    if "já monitora este processo" in body_txt or "ja monitora este processo" in body_txt:
+                        logger.info("Escavador %s %s: processo já monitorado, sem retry.", method, path)
+                        _set_last_api_error(method, path, r.status_code, r.text)
+                        raise EscavadorAlreadyMonitored((r.text or "").strip())
+
+                if r.status_code == 422 and method.upper() == "POST" and path.endswith("/solicitar-atualizacao"):
+                    body_json = {}
+                    try:
+                        body_json = r.json() if (r.text or "").strip() else {}
+                    except Exception:
+                        body_json = {}
+                    body_txt = ((body_json.get("message") or r.text or "")).lower()
+                    if "já está sendo atualizado" in body_txt or "ja está sendo atualizado" in body_txt or "ja esta sendo atualizado" in body_txt:
+                        logger.info("Escavador %s %s: atualização já em andamento, sem retry.", method, path)
+                        _set_last_api_error(method, path, r.status_code, r.text)
+                        raise EscavadorUpdateAlreadyRunning(body_json, (body_json.get("message") or "Atualização já em andamento."))
 
                 if r.status_code >= 400:
                     logger.error("Escavador %s %s failed %s: %s", method, path, r.status_code, r.text[:1200])
@@ -410,6 +442,128 @@ class EscavadorClient:
             cost = _estimate_cost_brl(service_key, items_upto=0)
             record_api_usage(doc=None, cnj=numero_cnj, service_key=service_key, endpoint=endpoint, http_status=status, items_count=0, cost_brl=cost)
 
+
+    def solicitar_atualizacao_processo(
+        self,
+        numero_cnj: str,
+        *,
+        documentos_publicos: bool = False,
+        autos: bool = False,
+        enviar_callback: bool = False,
+        utilizar_certificado: Optional[bool] = None,
+        certificado_id: Optional[int] = None,
+        usuario: Optional[str] = None,
+        senha: Optional[str] = None,
+        documentos_especificos: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Solicita atualização do processo no tribunal (assíncrono).
+
+        Docs Escavador API v2:
+          POST /processos/numero_cnj/{numero}/solicitar-atualizacao
+          - documentos_publicos=1 OU autos=1 (não simultâneos)
+        """
+        service_key = "v2_atualizacao_processo"
+        endpoint = f"/processos/numero_cnj/{numero_cnj}/solicitar-atualizacao"
+        payload: Dict[str, Any] = {}
+        if enviar_callback:
+            payload["enviar_callback"] = 1
+        if documentos_publicos:
+            payload["documentos_publicos"] = 1
+        if autos:
+            payload["autos"] = 1
+        if utilizar_certificado is not None:
+            payload["utilizar_certificado"] = 1 if utilizar_certificado else 0
+        if certificado_id is not None:
+            payload["certificado_id"] = int(certificado_id)
+        if usuario:
+            payload["usuario"] = str(usuario)
+        if senha:
+            payload["senha"] = str(senha)
+        if documentos_especificos:
+            payload["documentos_especificos"] = str(documentos_especificos)
+
+        status = None
+        data: Dict[str, Any] = {}
+        try:
+            data = self.post(endpoint, payload if payload else {})
+            status = 200
+            return data
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            raise
+        finally:
+            cost = _estimate_cost_brl(service_key, items_upto=0)
+            record_api_usage(doc=None, cnj=numero_cnj, service_key=service_key, endpoint=endpoint, http_status=status, items_count=0, cost_brl=cost)
+
+    def status_atualizacao_processo(self, numero_cnj: str) -> Dict[str, Any]:
+        """Consulta o status da última solicitação de atualização (se existir)."""
+        service_key = "v2_status_atualizacao_processo"
+        endpoint = f"/processos/numero_cnj/{numero_cnj}/status-atualizacao"
+        status = None
+        data: Dict[str, Any] = {}
+        try:
+            data = self.get(endpoint, params=None)
+            status = 200
+            return data
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            raise
+        finally:
+            cost = _estimate_cost_brl(service_key, items_upto=0)
+            record_api_usage(doc=None, cnj=numero_cnj, service_key=service_key, http_status=status, items_count=0, cost_brl=cost)
+
+    def listar_documentos_publicos(self, numero_cnj: str, limit: int = 100) -> Dict[str, Any]:
+        """Lista documentos públicos do processo (requer atualização com documentos_publicos=1 para ficar 'cheio')."""
+        service_key = "v2_documentos_publicos"
+        endpoint = f"/processos/numero_cnj/{numero_cnj}/documentos-publicos"
+        status = None
+        data: Dict[str, Any] = {}
+        try:
+            data = self.get(endpoint, {"limit": limit})
+            status = 200
+            return data
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            raise
+        finally:
+            cost = _estimate_cost_brl(service_key, items_upto=limit)
+            record_api_usage(doc=None, cnj=numero_cnj, service_key=service_key, http_status=status, items_count=limit, cost_brl=cost)
+
+    def listar_autos(self, numero_cnj: str, limit: int = 50) -> Dict[str, Any]:
+        """Lista autos (públicos + restritos). Requer atualização prévia com autos=1 e status SUCESSO."""
+        service_key = "v2_autos"
+        endpoint = f"/processos/numero_cnj/{numero_cnj}/autos"
+        status = None
+        data: Dict[str, Any] = {}
+        try:
+            data = self.get(endpoint, {"limit": limit})
+            status = 200
+            return data
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            raise
+        finally:
+            cost = _estimate_cost_brl(service_key, items_upto=limit)
+            record_api_usage(doc=None, cnj=numero_cnj, service_key=service_key, http_status=status, items_count=limit, cost_brl=cost)
+
+    def obter_documento_por_key(self, numero_cnj: str, key: str) -> Dict[str, Any]:
+        """Obtém metadados/links de um documento (key) para download."""
+        service_key = "v2_documento_key"
+        endpoint = f"/processos/numero_cnj/{numero_cnj}/documentos/{key}"
+        status = None
+        data: Dict[str, Any] = {}
+        try:
+            data = self.get(endpoint, params=None)
+            status = 200
+            return data
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            raise
+        finally:
+            cost = _estimate_cost_brl(service_key, items_upto=0)
+            record_api_usage(doc=None, cnj=numero_cnj, service_key=service_key, http_status=status, items_count=0, cost_brl=cost)
+
+
     def listar_processos_envolvido(self, cpf_cnpj: str, limit: int = 50, page: Optional[int] = None) -> Dict[str, Any]:
         service_key = "v2_processos_envolvido"
         params: Dict[str, Any] = {"cpf_cnpj": cpf_cnpj, "limit": limit}
@@ -443,86 +597,15 @@ class EscavadorClient:
             params["page"] = page
         return self.get("/callbacks", params=params)
 
-    def listar_documentos_publicos_v2(self, numero_cnj: str, limit: int = 50, page: int = 1) -> Dict[str, Any]:
-        """Lista documentos públicos de um processo pelo número CNJ (Escavador v2)."""
-        limit_n = 100 if int(limit) == 100 else 50
-        page_n = max(1, int(page))
-        endpoint = f"/processos/numero_cnj/{numero_cnj}/documentos-publicos"
-        return self.get(endpoint, {"limit": limit_n, "page": page_n})
-
-    def listar_autos_v2(self, numero_cnj: str, limit: int = 50, page: int = 1) -> Dict[str, Any]:
-        """Lista autos (documentos restritos) de um processo pelo número CNJ (Escavador v2)."""
-        limit_n = 100 if int(limit) == 100 else 50
-        page_n = max(1, int(page))
-        endpoint = f"/processos/numero_cnj/{numero_cnj}/autos"
-        return self.get(endpoint, {"limit": limit_n, "page": page_n})
-
-    def solicitar_atualizacao_v2(
-        self,
-        numero_cnj: str,
-        tipo_atualizacao: str = "PUBLICA",
-        send_callback: int = 0,
-        usuario: Optional[str] = None,
-        senha: Optional[str] = None,
-        certificado_id: Optional[int] = None,
-        documentos_especificos: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Solicita atualização de documentos de um processo no Escavador v2.
-
-        tipo_atualizacao: "PUBLICA" para documentos públicos, "RESTRITO" para autos.
-        """
-        endpoint = f"/processos/numero_cnj/{numero_cnj}/solicitar-atualizacao"
-        params: Dict[str, Any] = {}
-        if send_callback == 1:
-            params["send_callback"] = 1
-
-        payload: Dict[str, Any] = {
-            "tipo_atualizacao": tipo_atualizacao.upper(),
-        }
-        if tipo_atualizacao.upper() == "RESTRITO":
-            if usuario:
-                payload["usuario"] = str(usuario)
-            if senha:
-                payload["senha"] = str(senha)
-            if certificado_id is not None:
-                payload["certificado_id"] = int(certificado_id)
-            if documentos_especificos:
-                payload["documentos_especificos"] = str(documentos_especificos)
-
-        return self.post(endpoint, payload, params=params or None)
-
-    def status_atualizacao_v2(self, numero_cnj: str) -> Dict[str, Any]:
-        """Consulta o status de atualização de documentos/autos de um processo (Escavador v2)."""
-        endpoint = f"/processos/numero_cnj/{numero_cnj}/status-atualizacao"
-        return self.get(endpoint)
-
-    def baixar_documento_pdf_v2(self, numero_cnj: str, key: str) -> requests.Response:
-        """Baixa um documento (PDF) de um processo pelo key retornado pelo Escavador v2."""
-        endpoint = f"/processos/numero_cnj/{numero_cnj}/documentos/{key}"
-        return self._request_raw("GET", endpoint)
-
-    def _request_raw(self, method: str, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
-        """Faz uma requisição raw (sem JSON parsing) — usado para download de PDFs."""
-        url = self._url(path)
-        r = self.session.request(method, url, params=params, timeout=45)
-        r.raise_for_status()
-        return r
 
 # ----------------------------
 # SQLite
 # ----------------------------
-
-
 def db_connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-
-
-def db_conn() -> sqlite3.Connection:
-    # Backwards-compatible alias (some routes used db_conn)
-    return db_connect()
 
 def db_init() -> None:
     conn = db_connect()
@@ -626,6 +709,39 @@ def db_init() -> None:
         notes TEXT
     )"""
     )
+    
+    # Cache/controle de atualização + documentos (documentos públicos e autos)
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS processo_updates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cnj TEXT NOT NULL,
+        tipo TEXT NOT NULL, -- 'documentos_publicos' | 'autos'
+        escavador_update_id INTEGER,
+        status TEXT NOT NULL DEFAULT 'PENDENTE', -- PENDENTE|SUCESSO|ERRO|NAO_ENCONTRADO
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_error TEXT
+    )"""
+    )
+
+    cur.execute(
+        """
+    CREATE TABLE IF NOT EXISTS documentos_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cnj TEXT NOT NULL,
+        tipo TEXT NOT NULL, -- 'publicos' | 'autos'
+        doc_key TEXT NOT NULL,
+        titulo TEXT,
+        data TEXT,
+        mime TEXT,
+        meta_json TEXT,
+        download_url TEXT,
+        updated_at TEXT NOT NULL,
+        UNIQUE(cnj, tipo, doc_key)
+    )"""
+    )
+
     cur.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_ts ON api_usage (ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_doc_ts ON api_usage (doc, ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_cnj_ts ON api_usage (cnj, ts)")
@@ -685,33 +801,11 @@ def db_init() -> None:
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_eventos_cnj_id ON eventos_mov (cnj, id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_doc_process_doc ON doc_process (doc)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_docs_cache_cnj_tipo ON documentos_cache (cnj, tipo)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_updates_cnj_status ON processo_updates (cnj, status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_doc_process_cnj ON doc_process (cnj)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_inbox_status ON callback_inbox (status, id)")
 
-
-    # --- cache de documentos (Escavador v2) ---
-    cur.execute("""CREATE TABLE IF NOT EXISTS docs_v2_cache(
-        cnj TEXT NOT NULL,
-        tipo TEXT NOT NULL,
-        limit_n INTEGER NOT NULL,
-        page_n INTEGER NOT NULL,
-        items_json TEXT NOT NULL,
-        links_json TEXT,
-        paginator_json TEXT,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY(cnj,tipo,limit_n,page_n)
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS updates_v2(
-        cnj TEXT NOT NULL,
-        tipo TEXT NOT NULL,
-        request_json TEXT,
-        response_json TEXT,
-        status_json TEXT,
-        status TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY(cnj,tipo)
-    )""")
     conn.commit()
     conn.close()
 
@@ -1079,6 +1173,8 @@ def process_inbox_once(client: EscavadorClient, max_items: int = 25) -> Dict[str
             for cnj in cnjs:
                 try:
                     client.criar_monitor_processo(cnj)
+                except EscavadorAlreadyMonitored:
+                    logger.info("Monitoramento já existia para CNJ %s", cnj)
                 except requests.HTTPError as e:
                     logger.warning("criar_monitor_processo(%s) warning: %s", cnj, str(e))
 
@@ -1148,11 +1244,22 @@ def poll_callbacks_loop(client: EscavadorClient):
                 len(pr.get("linked", [])),
             )
             _set_poll_state(last_totals={"inserted": inserted, "processed": pr["processed"], "errors": pr["errors"], "linked": len(pr.get("linked", []))}, last_finished=utcnow_iso())
+        except EscavadorUnauthorized as e:
+            logger.warning("Polling pausado por token não autorizado em /callbacks: %s", str(e)[:300])
+            _set_poll_state(last_error=str(e), last_finished=utcnow_iso())
         except Exception as e:
             logger.exception("Polling failed")
             _set_poll_state(last_error=str(e), last_finished=utcnow_iso())
         finally:
             _set_poll_state(running=False)
+
+        # também verifica solicitações pendentes de atualização (docs/autos)
+        try:
+            upd = process_updates_once(client, max_items=10)
+            if upd.get("checked") or upd.get("errors"):
+                logger.info("Updates: checked=%s completed=%s errors=%s", upd.get("checked"), upd.get("completed"), upd.get("errors"))
+        except Exception:
+            logger.exception("Updates polling failed")
 
         stop_flag.wait(POLL_INTERVAL_SECONDS)
 
@@ -1596,411 +1703,363 @@ def sync_process(cnj: str):
 
 
 
+# ============================================================
+# API JSON: Atualização (tribunal) + Documentos (públicos/autos)
+# ============================================================
 
-@app.get("/processos/<path:cnj>/documentos-publicos")
-def api_documentos_publicos_v2(cnj: str):
-    require_token_configured()
-    if not CNJ_REGEX.fullmatch(cnj):
-        return jsonify({"ok": False, "error": "CNJ inválido"}), 422
+def _docs_cache_upsert(cnj: str, tipo: str, item: Dict[str, Any]) -> None:
+    """Armazena metadados de documento no cache local (SQLite)."""
+    key = (item.get("key") or item.get("chave") or item.get("id") or "").strip()
+    if not key:
+        return
+    titulo = item.get("titulo") or item.get("nome") or item.get("descricao") or None
+    data_doc = item.get("data") or item.get("data_documento") or item.get("data_protocolo") or None
+    mime = item.get("mime") or item.get("mime_type") or item.get("content_type") or None
+    links = item.get("links") or {}
+    download_url = None
+    if isinstance(links, dict):
+        download_url = links.get("download") or links.get("url") or links.get("api")
+    meta_json = safe_json_dumps(item)
 
-    limit_n = 100 if int(request.args.get("limit") or 50) == 100 else 50
-    page_n = max(1, int(request.args.get("page") or 1))
-
-    conn = db_conn()
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute(
-        "SELECT items_json, links_json, paginator_json, updated_at FROM docs_v2_cache WHERE cnj=? AND tipo=? AND limit_n=? AND page_n=?",
-        (cnj, "publicos", limit_n, page_n),
-    )
-    row = cur.fetchone()
-    if row:
-        items_json, links_json, paginator_json, updated_at = row
-        return jsonify({
-            "ok": True, "cnj": cnj, "tipo": "publicos", "cached": True,
-            "items": json.loads(items_json),
-            "links": json.loads(links_json) if links_json else None,
-            "paginator": json.loads(paginator_json) if paginator_json else None,
-            "updated_at": updated_at,
-        })
-
-    try:
-        data = client.listar_documentos_publicos_v2(cnj, limit=limit_n, page=page_n)
-    except Exception as e:
-        return jsonify({"ok": False, "cnj": cnj, "error": str(e)}), 502
-
-    items = data.get("items") if isinstance(data, dict) else []
-    if not isinstance(items, list):
-        items = []
-    links = data.get("links") if isinstance(data, dict) else None
-    paginator = data.get("paginator") if isinstance(data, dict) else None
-
-    now = utcnow_iso()
-    cur.execute(
-        "INSERT OR REPLACE INTO docs_v2_cache(cnj,tipo,limit_n,page_n,items_json,links_json,paginator_json,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-        (
-            cnj, "publicos", limit_n, page_n,
-            json.dumps(items, ensure_ascii=False),
-            json.dumps(links, ensure_ascii=False) if links else None,
-            json.dumps(paginator, ensure_ascii=False) if paginator else None,
-            now,
-        ),
+        """
+        INSERT INTO documentos_cache (cnj, tipo, doc_key, titulo, data, mime, meta_json, download_url, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(cnj, tipo, doc_key) DO UPDATE SET
+          titulo=excluded.titulo,
+          data=excluded.data,
+          mime=excluded.mime,
+          meta_json=excluded.meta_json,
+          download_url=excluded.download_url,
+          updated_at=excluded.updated_at
+        """,
+        (cnj, tipo, key, titulo, data_doc, mime, meta_json, download_url, utcnow_iso()),
     )
     conn.commit()
-    return jsonify({"ok": True, "cnj": cnj, "tipo": "publicos", "cached": False, "items": items, "links": links, "paginator": paginator, "updated_at": now})
+    conn.close()
 
 
-@app.get("/processos/<path:cnj>/autos")
-def api_autos_v2(cnj: str):
-    require_token_configured()
-    if not CNJ_REGEX.fullmatch(cnj):
-        return jsonify({"ok": False, "error": "CNJ inválido"}), 422
-
-    limit_n = 100 if int(request.args.get("limit") or 50) == 100 else 50
-    page_n = max(1, int(request.args.get("page") or 1))
-
-    conn = db_conn()
+def _docs_cache_list(cnj: str, tipo: str) -> List[Dict[str, Any]]:
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute(
-        "SELECT items_json, links_json, paginator_json, updated_at FROM docs_v2_cache WHERE cnj=? AND tipo=? AND limit_n=? AND page_n=?",
-        (cnj, "autos", limit_n, page_n),
+        "SELECT doc_key, titulo, data, mime, meta_json, download_url, updated_at FROM documentos_cache WHERE cnj=? AND tipo=? ORDER BY COALESCE(data,'') DESC, doc_key",
+        (cnj, tipo),
     )
-    row = cur.fetchone()
-    if row:
-        items_json, links_json, paginator_json, updated_at = row
-        return jsonify({
-            "ok": True, "cnj": cnj, "tipo": "autos", "cached": True,
-            "items": json.loads(items_json),
-            "links": json.loads(links_json) if links_json else None,
-            "paginator": json.loads(paginator_json) if paginator_json else None,
-            "updated_at": updated_at,
-        })
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    # meta_json volta como string; manter também um 'meta' parsed opcional
+    for r in rows:
+        try:
+            r["meta"] = json.loads(r.get("meta_json") or "{}")
+        except Exception:
+            r["meta"] = {}
+    return rows
 
-    try:
-        data = client.listar_autos_v2(cnj, limit=limit_n, page=page_n)
-    except Exception as e:
-        return jsonify({"ok": False, "cnj": cnj, "error": str(e)}), 502
 
-    items = data.get("items") if isinstance(data, dict) else []
-    if not isinstance(items, list):
-        items = []
-    links = data.get("links") if isinstance(data, dict) else None
-    paginator = data.get("paginator") if isinstance(data, dict) else None
-
-    now = utcnow_iso()
+def _update_row_upsert(cnj: str, tipo: str, *, status: str, escavador_update_id: Optional[int] = None, last_error: Optional[str] = None) -> None:
+    conn = db_connect()
+    cur = conn.cursor()
     cur.execute(
-        "INSERT OR REPLACE INTO docs_v2_cache(cnj,tipo,limit_n,page_n,items_json,links_json,paginator_json,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-        (
-            cnj, "autos", limit_n, page_n,
-            json.dumps(items, ensure_ascii=False),
-            json.dumps(links, ensure_ascii=False) if links else None,
-            json.dumps(paginator, ensure_ascii=False) if paginator else None,
-            now,
-        ),
+        """
+        INSERT INTO processo_updates (cnj, tipo, escavador_update_id, status, created_at, updated_at, last_error)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT DO NOTHING
+        """,
+        (cnj, tipo, escavador_update_id, status, utcnow_iso(), utcnow_iso(), last_error),
+    )
+    # sempre atualizar o registro mais recente do tipo/cnj
+    cur.execute(
+        """
+        UPDATE processo_updates
+           SET escavador_update_id = COALESCE(?, escavador_update_id),
+               status=?,
+               updated_at=?,
+               last_error=?
+         WHERE id = (
+            SELECT id FROM processo_updates WHERE cnj=? AND tipo=? ORDER BY id DESC LIMIT 1
+         )
+        """,
+        (escavador_update_id, status, utcnow_iso(), last_error, cnj, tipo),
     )
     conn.commit()
-    return jsonify({"ok": True, "cnj": cnj, "tipo": "autos", "cached": False, "items": items, "links": links, "paginator": paginator, "updated_at": now})
+    conn.close()
+
+
+def _update_row_latest(cnj: str, tipo: str) -> Optional[Dict[str, Any]]:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM processo_updates WHERE cnj=? AND tipo=? ORDER BY id DESC LIMIT 1",
+        (cnj, tipo),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _extract_status_value(status_payload: Dict[str, Any]) -> Optional[str]:
+    """Normaliza status da API em algo como PENDENTE/SUCESSO/ERRO."""
+    if not isinstance(status_payload, dict):
+        return None
+    # a doc mostra "status" e outros campos, mas vamos ser permissivos
+    for k in ("status", "estado", "situacao"):
+        v = status_payload.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip().upper()
+    return None
+
+
+def process_updates_once(client: EscavadorClient, max_items: int = 10) -> Dict[str, Any]:
+    """Verifica status de solicitações pendentes e, ao concluir, puxa docs/autos e grava no cache."""
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, cnj, tipo, status FROM processo_updates WHERE status IN ('PENDENTE','ERRO') ORDER BY updated_at ASC LIMIT ?",
+        (max_items,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    checked = 0
+    completed = 0
+    errors = 0
+
+    for r in rows:
+        cnj = r["cnj"]
+        tipo = r["tipo"]
+        try:
+            st = client.status_atualizacao_processo(cnj)
+            checked += 1
+            st_val = _extract_status_value(st) or "PENDENTE"
+            if st_val == "SUCESSO":
+                _update_row_upsert(cnj, tipo, status="SUCESSO", last_error=None)
+                # puxa lista e cacheia
+                if tipo == "documentos_publicos":
+                    data = client.listar_documentos_publicos(cnj, limit=100)
+                    items = extract_list(data)
+                    for it in items:
+                        _docs_cache_upsert(cnj, "publicos", it)
+                elif tipo == "autos":
+                    data = client.listar_autos(cnj, limit=50)
+                    items = extract_list(data)
+                    for it in items:
+                        _docs_cache_upsert(cnj, "autos", it)
+                completed += 1
+            elif st_val in ("ERRO", "FALHA", "FAILED"):
+                _update_row_upsert(cnj, tipo, status="ERRO", last_error=safe_json_dumps(st)[:1000])
+                errors += 1
+            else:
+                _update_row_upsert(cnj, tipo, status="PENDENTE", last_error=None)
+        except Exception as ex:
+            _update_row_upsert(cnj, tipo, status="ERRO", last_error=str(ex)[:1000])
+            errors += 1
+
+    return {"checked": checked, "completed": completed, "errors": errors}
 
 
 @app.post("/processos/<path:cnj>/solicitar-atualizacao")
-def api_solicitar_atualizacao_v2(cnj: str):
+def solicitar_atualizacao(cnj: str):
+    """Solicita atualização no tribunal, com escolha entre documentos públicos ou autos."""
     require_token_configured()
     if not CNJ_REGEX.fullmatch(cnj):
-        return jsonify({"ok": False, "error": "CNJ inválido"}), 422
-
-    payload = request.get_json(silent=True) or {}
-    tipo = (payload.get("tipo") or "publicos").strip().lower()
-    # Mapeia "publicos"/"autos" para os valores que a API do Escavador aceita
-    tipo_atualizacao = "RESTRITO" if tipo == "autos" else "PUBLICA"
-    send_callback = 1 if payload.get("enviar_callback") else 0
-
+        abort(400, description="CNJ inválido.")
+    payload = request.get_json(force=True, silent=True) or {}
+    tipo = (payload.get("tipo") or "").strip().lower()
+    if tipo not in ("documentos_publicos", "autos"):
+        abort(400, description="tipo deve ser 'documentos_publicos' ou 'autos'.")
     try:
-        resp = client.solicitar_atualizacao_v2(
-            cnj,
-            tipo_atualizacao=tipo_atualizacao,
-            send_callback=send_callback,
-            usuario=payload.get("usuario"),
-            senha=payload.get("senha"),
-            certificado_id=payload.get("certificado_id"),
-            documentos_especificos=payload.get("documentos_especificos"),
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "cnj": cnj, "tipo": tipo, "error": str(e)}), 502
+        if tipo == "documentos_publicos":
+            res = client.solicitar_atualizacao_processo(cnj, documentos_publicos=True, autos=False, enviar_callback=False)  # type: ignore
+        else:
+            # autos exigem autenticação (certificado ou user/senha). Aqui só repassamos o que vier.
+            res = client.solicitar_atualizacao_processo(
+                cnj,
+                documentos_publicos=False,
+                autos=True,
+                enviar_callback=False,
+                utilizar_certificado=payload.get("utilizar_certificado"),
+                certificado_id=payload.get("certificado_id"),
+                usuario=payload.get("usuario"),
+                senha=payload.get("senha"),
+                documentos_especificos=payload.get("documentos_especificos"),
+            )  # type: ignore
 
-    now = utcnow_iso()
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO updates_v2(cnj,tipo,request_json,response_json,status_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-        (cnj, tipo, json.dumps(payload, ensure_ascii=False), json.dumps(resp, ensure_ascii=False), None, None, now, now),
-    )
-    conn.commit()
-    return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "response": resp})
+        _update_row_upsert(cnj, tipo, status="PENDENTE", last_error=None)
+        return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "result": res, "pending": True, "message": "Solicitação enviada ao Escavador. Atualização em andamento."})
+    except EscavadorUpdateAlreadyRunning as e:
+        payload_remote = e.payload if isinstance(e.payload, dict) else {}
+        ultima = (payload_remote.get("appends") or {}).get("ultima_verificacao") or {}
+        remote_status = ((ultima.get("status") or payload_remote.get("status") or "PENDENTE").strip().upper() if isinstance((ultima.get("status") or payload_remote.get("status") or "PENDENTE"), str) else "PENDENTE")
+        _update_row_upsert(cnj, tipo, status="PENDENTE", last_error=None, escavador_update_id=ultima.get("id"))
+        return jsonify({
+            "ok": True,
+            "cnj": cnj,
+            "tipo": tipo,
+            "pending": True,
+            "already_running": True,
+            "message": str(e),
+            "status": remote_status,
+            "ultima_verificacao": ultima,
+        }), 200
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", 500)
+        msg = None
+        try:
+            msg = (e.response.json() or {}).get("error") or (e.response.json() or {}).get("message")
+        except Exception:
+            msg = str(e)
+        _update_row_upsert(cnj, tipo, status="ERRO", last_error=(msg or str(e))[:1000])
+        return jsonify({"ok": False, "error": "ESCAVADOR_HTTP_ERROR", "status": status, "message": msg, "cnj": cnj}), status
+    except Exception as ex:
+        _update_row_upsert(cnj, tipo, status="ERRO", last_error=str(ex)[:1000])
+        return jsonify({"ok": False, "error": "ERRO_INTERNO", "message": str(ex), "cnj": cnj}), 500
 
 
-@app.get("/processos/<path:cnj>/solicitar-status")
-def api_solicitar_status_v2(cnj: str):
+@app.get("/processos/<path:cnj>/status-atualizacao")
+def status_atualizacao(cnj: str):
     require_token_configured()
     if not CNJ_REGEX.fullmatch(cnj):
-        return jsonify({"ok": False, "error": "CNJ inválido"}), 422
-
-    tipo = (request.args.get("tipo") or "publicos").strip().lower()
+        abort(400, description="CNJ inválido.")
     try:
-        st = client.status_atualizacao_v2(cnj)
-    except Exception as e:
-        conn = db_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT status_json, status, updated_at FROM updates_v2 WHERE cnj=? AND tipo=?", (cnj, tipo))
-        row = cur.fetchone()
-        if row:
-            status_json, status_s, updated_at = row
-            return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "cached": True, "status": status_s, "status_json": json.loads(status_json) if status_json else None, "updated_at": updated_at, "warn": str(e)})
-        return jsonify({"ok": False, "cnj": cnj, "tipo": tipo, "error": str(e)}), 502
+        st = client.status_atualizacao_processo(cnj)  # type: ignore
+        return jsonify({"ok": True, "cnj": cnj, "status": st, "local": {
+            "documentos_publicos": _update_row_latest(cnj, "documentos_publicos"),
+            "autos": _update_row_latest(cnj, "autos"),
+        }})
+    except requests.HTTPError as e:
+        status = getattr(e.response, "status_code", 500)
+        msg = None
+        try:
+            msg = (e.response.json() or {}).get("error") or (e.response.json() or {}).get("message")
+        except Exception:
+            msg = str(e)
+        return jsonify({"ok": False, "error": "ESCAVADOR_HTTP_ERROR", "status": status, "message": msg, "cnj": cnj}), status
 
-    status_s = None
-    if isinstance(st, dict):
-        status_s = st.get("status") or st.get("estado") or st.get("state")
 
-    now = utcnow_iso()
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO updates_v2(cnj,tipo,request_json,response_json,status_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-        (cnj, tipo, None, None, json.dumps(st, ensure_ascii=False), status_s, now, now),
-    )
-    conn.commit()
-    return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "cached": False, "status": status_s, "status_json": st, "updated_at": now})
+@app.get("/processos/<path:cnj>/documentos-publicos")
+def api_list_documentos_publicos(cnj: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        abort(400, description="CNJ inválido.")
+    # primeiro tenta cache
+    cached = _docs_cache_list(cnj, "publicos")
+    if cached:
+        return jsonify({"ok": True, "cnj": cnj, "tipo": "publicos", "source": "cache", "items": cached})
+
+    # fallback: tentar listar direto
+    try:
+        data = client.listar_documentos_publicos(cnj, limit=100)  # type: ignore
+        items = extract_list(data)
+        for it in items:
+            _docs_cache_upsert(cnj, "publicos", it)
+        return jsonify({"ok": True, "cnj": cnj, "tipo": "publicos", "source": "api", "items": _docs_cache_list(cnj, "publicos")})
+    except Exception as ex:
+        return jsonify({"ok": True, "cnj": cnj, "tipo": "publicos", "source": "empty", "items": [], "warning": str(ex)})
+
+
+@app.get("/processos/<path:cnj>/autos")
+def api_list_autos(cnj: str):
+    require_token_configured()
+    if not CNJ_REGEX.fullmatch(cnj):
+        abort(400, description="CNJ inválido.")
+    cached = _docs_cache_list(cnj, "autos")
+    if cached:
+        return jsonify({"ok": True, "cnj": cnj, "tipo": "autos", "source": "cache", "items": cached})
+
+    try:
+        data = client.listar_autos(cnj, limit=50)  # type: ignore
+        items = extract_list(data)
+        for it in items:
+            _docs_cache_upsert(cnj, "autos", it)
+        return jsonify({"ok": True, "cnj": cnj, "tipo": "autos", "source": "api", "items": _docs_cache_list(cnj, "autos")})
+    except Exception as ex:
+        return jsonify({"ok": True, "cnj": cnj, "tipo": "autos", "source": "empty", "items": [], "warning": str(ex)})
 
 
 @app.get("/processos/<path:cnj>/documentos/<path:key>")
-def api_download_documento_v2(cnj: str, key: str):
+def api_get_documento_key(cnj: str, key: str):
     require_token_configured()
     if not CNJ_REGEX.fullmatch(cnj):
-        return jsonify({"ok": False, "error": "CNJ inválido"}), 422
-    try:
-        r = client.baixar_documento_pdf_v2(cnj, key)
-    except Exception as e:
-        return jsonify({"ok": False, "cnj": cnj, "error": str(e)}), 502
-
-    filename = f"documento_{cnj}.pdf"
-    headers = {
-        "Content-Type": r.headers.get("Content-Type", "application/pdf"),
-        "Content-Disposition": r.headers.get("Content-Disposition", f'attachment; filename="{filename}"'),
-    }
-    return Response(r.content, status=200, headers=headers)
+        abort(400, description="CNJ inválido.")
+    data = client.obter_documento_por_key(cnj, key)  # type: ignore
+    return jsonify({"ok": True, "cnj": cnj, "key": key, "data": data})
 
 
-@app.get("/ui/docs-v2/<path:cnj>")
-def ui_docs_v2(cnj: str):
+@app.get("/processos/<path:cnj>/documentos/<path:key>/download")
+def api_download_documento_key(cnj: str, key: str):
+    require_token_configured()
     if not CNJ_REGEX.fullmatch(cnj):
-        return "CNJ inválido", 422
+        abort(400, description="CNJ inválido.")
+    data = client.obter_documento_por_key(cnj, key)  # type: ignore
+    links = (data or {}).get("links") or {}
+    url = None
+    if isinstance(links, dict):
+        url = links.get("download") or links.get("url")
+    if not url:
+        url = (data or {}).get("url")
+    if not url:
+        abort(404, description="Link de download não disponível para este documento.")
+    return redirect(url)
 
-    esc_map_js = json.dumps({"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"})
 
-    html = f"""<!doctype html>
-<html lang="pt-br">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Documentos v2 - {cnj}</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <style>
-    body{{background:#0b1220;color:#e6e6e6}}
-    .muted{{color:#9aa4b2}}
-    a{{color:#8bd3ff}}
-  </style>
-</head>
-<body class="p-3">
-  <div class="container">
-    <div class="d-flex align-items-center justify-content-between mb-3">
-      <div>
-        <div class="h4 mb-0">Documentos (Escavador v2)</div>
-        <div class="muted small">{cnj}</div>
-      </div>
-      <a class="btn btn-sm btn-outline-light" href="/ui/processo/{cnj}">Voltar ao processo</a>
-    </div>
+# ============================================================
+# UI API: Documentos (públicos/autos)
+# ============================================================
+@app.get("/ui/api/processo/<path:cnj>/documentos")
+def ui_api_documentos(cnj: str):
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
 
-    <div class="card bg-dark border-secondary mb-3">
-      <div class="card-body">
-        <div class="row g-2 align-items-end">
-          <div class="col-md-3">
-            <label class="form-label small muted">Tipo</label>
-            <select id="tipo" class="form-select form-select-sm bg-dark text-light border-secondary">
-              <option value="publicos">Documentos públicos</option>
-              <option value="autos">Autos (restritos)</option>
-            </select>
-          </div>
-          <div class="col-md-2">
-            <label class="form-label small muted">Limite</label>
-            <select id="limit" class="form-select form-select-sm bg-dark text-light border-secondary">
-              <option value="50">50</option>
-              <option value="100">100</option>
-            </select>
-          </div>
-          <div class="col-md-2">
-            <label class="form-label small muted">Página</label>
-            <input id="page" class="form-control form-control-sm bg-dark text-light border-secondary" value="1"/>
-          </div>
-          <div class="col-md-5 text-end">
-            <button id="btnListar" class="btn btn-sm btn-outline-light">Listar</button>
-            <button id="btnSolicitar" class="btn btn-sm btn-warning">Solicitar atualização</button>
-          </div>
+    tipo = (request.args.get("tipo") or "publicos").strip().lower()
+    if tipo not in ("publicos", "autos"):
+        return jsonify({"ok": False, "error": "TIPO_INVALIDO", "message": "tipo deve ser publicos|autos"}), 400
 
-          <div class="col-12" id="autosBox" style="display:none">
-            <hr class="border-secondary"/>
-            <div class="row g-2">
-              <div class="col-md-3">
-                <label class="form-label small muted">Usar certificado</label>
-                <select id="utilizar_certificado" class="form-select form-select-sm bg-dark text-light border-secondary">
-                  <option value="">(não informado)</option>
-                  <option value="1">Sim</option>
-                  <option value="0">Não</option>
-                </select>
-              </div>
-              <div class="col-md-3">
-                <label class="form-label small muted">certificado_id</label>
-                <input id="certificado_id" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="ex: 123"/>
-              </div>
-              <div class="col-md-3">
-                <label class="form-label small muted">Usuário</label>
-                <input id="usuario" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="login tribunal"/>
-              </div>
-              <div class="col-md-3">
-                <label class="form-label small muted">Senha</label>
-                <input id="senha" type="password" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="senha tribunal"/>
-              </div>
-              <div class="col-md-6">
-                <label class="form-label small muted">documentos_especificos</label>
-                <input id="documentos_especificos" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="ex: INICIAIS"/>
-              </div>
-              <div class="col-md-6 d-flex align-items-end">
-                <div class="form-check">
-                  <input id="enviar_callback" class="form-check-input" type="checkbox"/>
-                  <label class="form-check-label small muted" for="enviar_callback">enviar_callback=1</label>
-                </div>
-              </div>
-            </div>
-            <div class="muted small mt-2">Autos exigem autenticação habilitada na sua conta Escavador.</div>
-          </div>
-        </div>
-      </div>
-    </div>
+    # cache sempre primeiro
+    cached = _docs_cache_list(cnj, tipo)
+    if cached:
+        return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "source": "cache", "items": cached})
 
-    <div id="status" class="muted small mb-2"></div>
-    <div id="out" class="muted small">Clique em <b>Listar</b>.</div>
-  </div>
+    # tentativa via API (pode falhar caso ainda não tenha solicitado atualização)
+    try:
+        require_token_configured()
+        if tipo == "publicos":
+            data = client.listar_documentos_publicos(cnj, limit=100)  # type: ignore
+        else:
+            data = client.listar_autos(cnj, limit=50)  # type: ignore
+        items = extract_list(data)
+        for it in items:
+            _docs_cache_upsert(cnj, tipo, it)
+        return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "source": "api", "items": _docs_cache_list(cnj, tipo)})
+    except Exception as ex:
+        return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "source": "empty", "items": [], "warning": str(ex)})
 
-  <script>
-    const CNJ = {json.dumps(cnj)};
-    // Obs: em f-strings do Python, chaves do JS entram como "format specifiers" se ficarem literais aqui.
-    // Para evitar dor de cabeça (e escapar aspas/backslashes), geramos um JSON string no Python e fazemos JSON.parse aqui.
-    const ESC_MAP = JSON.parse({json.dumps(json.dumps({"&":"&amp;","<":"&lt;",">":"&gt;",'"': "&quot;","'":"&#39;"}))});
-    const esc = (s)=>String(s||"").replace(/[&<>"']/g, c=>(ESC_MAP[c]||c));
-    function tipo(){{ return document.getElementById("tipo").value; }}
-    function showAutos(){{ document.getElementById("autosBox").style.display = (tipo()==="autos") ? "" : "none"; }}
-    document.getElementById("tipo").addEventListener("change", showAutos);
-    showAutos();
 
-    async function listar(){{
-      const t = tipo();
-      const limit = parseInt(document.getElementById("limit").value, 10);
-      const page = parseInt(document.getElementById("page").value || "1", 10);
-      const out = document.getElementById("out");
-      const st = document.getElementById("status");
-      out.textContent = "Carregando...";
-      st.textContent = "";
-      try{{
-        const url = (t==="autos")
-          ? `/processos/${{encodeURIComponent(CNJ)}}/autos?limit=${{limit}}&page=${{page}}`
-          : `/processos/${{encodeURIComponent(CNJ)}}/documentos-publicos?limit=${{limit}}&page=${{page}}`;
-        const r = await fetch(url);
-        const j = await r.json();
-        if(!j.ok) throw new Error(j.error || "Falha");
-        const items = j.items || [];
-        st.textContent = (j.cached ? "Cache: " : "Atualizado: ") + (j.updated_at || "");
-        if(!items.length){{ out.innerHTML = "<span class='muted'>Nenhum documento encontrado.</span>"; return; }}
-        const rows = items.map(it=>{{
-          const k = it.key ? encodeURIComponent(it.key) : "";
-          const dl = it.key ? `<a class="btn btn-sm btn-outline-light" href="/processos/${{encodeURIComponent(CNJ)}}/documentos/${{k}}">Baixar</a>` : "";
-          return `<tr>
-            <td><div class="fw-semibold">${{esc(it.titulo || it.descricao || "Documento")}}</div><div class="muted small">${{esc(it.descricao||"")}}</div></td>
-            <td class="small">${{esc(it.data||"")}}</td>
-            <td class="small">${{esc(it.tipo||"")}}</td>
-            <td class="small">${{esc(it.extensao_arquivo||"")}}</td>
-            <td class="small">${{it.quantidade_paginas==null?"":it.quantidade_paginas}}</td>
-            <td class="text-end">${{dl}}</td>
-          </tr>`;
-        }}).join("");
-        out.innerHTML = `<div class="table-responsive">
-          <table class="table table-dark table-hover align-middle">
-            <thead><tr><th>Título</th><th>Data</th><th>Tipo</th><th>Ext</th><th>Pág.</th><th></th></tr></thead>
-            <tbody>${{rows}}</tbody>
-          </table></div>`;
-      }}catch(e){{
-        out.innerHTML = `<span class="text-danger">Erro: ${{esc(e)}}</span>`;
-      }}
-    }}
+@app.post("/ui/api/processo/<path:cnj>/solicitar-atualizacao")
+def ui_api_solicitar_atualizacao(cnj: str):
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
+    payload = request.get_json(force=True, silent=True) or {}
+    tipo = (payload.get("tipo") or "").strip().lower()
+    if tipo not in ("documentos_publicos", "autos"):
+        return jsonify({"ok": False, "error": "TIPO_INVALIDO", "message": "tipo deve ser documentos_publicos|autos"}), 400
+    # reaproveita rota API
+    return solicitar_atualizacao(cnj)
 
-    async function solicitar(){{
-      const t = tipo();
-      const st = document.getElementById("status");
-      st.textContent = "Solicitando atualização...";
-      const body = {{tipo: t}};
-      if(document.getElementById("enviar_callback").checked) body.enviar_callback = 1;
-      if(t === "autos"){{
-        const uc = document.getElementById("utilizar_certificado").value;
-        if(uc==="1") body.utilizar_certificado = true;
-        if(uc==="0") body.utilizar_certificado = false;
-        const cid = document.getElementById("certificado_id").value;
-        if(cid) body.certificado_id = parseInt(cid,10);
-        const u = document.getElementById("usuario").value;
-        const p = document.getElementById("senha").value;
-        const de = document.getElementById("documentos_especificos").value;
-        if(u) body.usuario = u;
-        if(p) body.senha = p;
-        if(de) body.documentos_especificos = de;
-      }}
-      try{{
-        const r = await fetch(`/processos/${{encodeURIComponent(CNJ)}}/solicitar-atualizacao`, {{
-          method:"POST",
-          headers:{{"Content-Type":"application/json"}},
-          body: JSON.stringify(body)
-        }});
-        const j = await r.json();
-        if(!j.ok) throw new Error(j.error || "Falha");
-        st.textContent = "Solicitação enviada. Consultando status...";
-        pollStatus();
-      }}catch(e){{
-        st.innerHTML = `<span class="text-danger">Erro: ${{esc(e)}}</span>`;
-      }}
-    }}
 
-    let timer=null;
-    async function pollStatus(){{
-      const t = tipo();
-      const st = document.getElementById("status");
-      try{{
-        const r = await fetch(`/processos/${{encodeURIComponent(CNJ)}}/solicitar-status?tipo=${{encodeURIComponent(t)}}`);
-        const j = await r.json();
-        if(!j.ok) throw new Error(j.error || "Falha");
-        const s = (j.status || (j.status_json && (j.status_json.status || j.status_json.estado || j.status_json.state)) || "PENDENTE");
-        st.innerHTML = `Status: <b>${{esc(s)}}</b>`;
-        const ss = String(s).toUpperCase();
-        if(ss.includes("SUCESSO") || ss.includes("SUCCESS")){{ clearTimeout(timer); timer=null; listar(); return; }}
-        if(ss.includes("ERRO") || ss.includes("ERROR") || ss.includes("FALHA") || ss.includes("FAILED")){{ clearTimeout(timer); timer=null; return; }}
-      }}catch(e){{
-        st.innerHTML = `<span class="text-danger">Erro status: ${{esc(e)}}</span>`;
-        clearTimeout(timer); timer=null; return;
-      }}
-      timer = setTimeout(pollStatus, 3000);
-    }}
+@app.get("/ui/api/processo/<path:cnj>/status-atualizacao")
+def ui_api_status_atualizacao(cnj: str):
+    if not CNJ_REGEX.fullmatch(cnj):
+        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
+    return status_atualizacao(cnj)
 
-    document.getElementById("btnListar").addEventListener("click", (e)=>{{e.preventDefault(); listar();}});
-    document.getElementById("btnSolicitar").addEventListener("click", (e)=>{{e.preventDefault(); solicitar();}});
-  </script>
-</body>
-</html>"""
-    return html
 
+@app.get("/ui/api/processo/<path:cnj>/documentos/<path:key>/download")
+def ui_api_download_documento(cnj: str, key: str):
+    # Proxy/redirect para download
+    return api_download_documento_key(cnj, key)
 
 @app.get("/processos/<path:cnj>/movimentacoes")
 def get_movs(cnj: str):
@@ -2100,7 +2159,7 @@ UI_BASE = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Blue Service | Monitor Escavador</title>
+  <title>Specter</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
     :root{
@@ -2207,6 +2266,20 @@ UI_BASE = """
       box-shadow: var(--shadow);
     }
     .side-title{ font-weight: 800; }
+    .summary-head{ display:flex; flex-wrap:wrap; align-items:flex-start; justify-content:space-between; gap:10px; }
+    .summary-main{ min-width:0; flex:1 1 180px; }
+    #badge-hoje{ display:flex; justify-content:flex-end; flex:0 0 auto; max-width:100%; }
+    .summary-metrics > [class*='col-']{ display:flex; min-width:0; }
+.summary-metrics .kpi{ width:100%; min-height:128px; }
+.summary-metrics .kpi .value{ white-space:normal; overflow-wrap:anywhere; word-break:break-word; }
+    .docs-note{ border:1px solid rgba(48,80,160,.16); border-radius:14px; background:rgba(48,80,160,.04); padding:10px 12px; }
+    @media (max-width: 991.98px){
+      .sticky-side{ position:static; }
+    }
+    @media (max-width: 575.98px){
+      .summary-head{ flex-direction:column; }
+      #badge-hoje{ justify-content:flex-start; }
+    }
     .divider{ border-color: var(--border); }
     .chip-click{
       cursor: pointer;
@@ -2314,17 +2387,6 @@ UI_BASE = """
   border: 1px solid var(--border);
 }
 
-/* md-body — Markdown rendered content */
-.md-body h1, .md-body h2, .md-body h3 { color: var(--bs-primary); margin-top: 1.4rem; margin-bottom: .5rem; }
-.md-body table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; font-size: .93rem; }
-.md-body th, .md-body td { border: 1px solid var(--border); padding: .45rem .7rem; text-align: left; }
-.md-body th { background: rgba(48,80,160,.12); font-weight: 600; }
-.md-body tr:nth-child(even) td { background: rgba(255,255,255,.03); }
-.md-body code { background: rgba(48,80,160,.13); border-radius: 5px; padding: .15rem .4rem; font-size: .9em; }
-.md-body pre { background: #0d1525; border: 1px solid var(--border); border-radius: 10px; padding: 1rem; overflow-x: auto; }
-.md-body blockquote { border-left: 3px solid var(--bs-primary); padding-left: 1rem; color: var(--muted); margin: .8rem 0; }
-.md-body hr { border-color: var(--border); margin: 1.5rem 0; }
-
   </style>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
@@ -2401,15 +2463,15 @@ UI_BASE = """
 <nav class="navbar navbar-dark">
   <div class="container py-2 d-flex justify-content-between align-items-center">
     <div>
-      <div class="h4 mb-0">Blue Service | Monitor Escavador</div>
-      <div class="small" style="opacity:.9">Flask • SQLite • Movimentações em timeline</div>
+      <div class="h4 mb-0">Specter</div>
+      <div class="small" style="opacity:.9">Monitor jurídico local • Flask • SQLite • Movimentações em timeline</div>
     </div>
     <div class="d-flex gap-2">
       <a class="pill" href="/ui">Dashboard</a>
       <a class="pill" href="/ui/watchlist">Watch-List</a>
+      <a class="pill" href="/ui/admin/monitoramentos">Monitoramentos</a>
       <a class="pill" href="/ui/admin">Admin <span id="navBadge" class="badge bg-danger ms-1" style="display:none"></span></a>
       <a class="pill" href="/health">Health</a>
-      <a class="pill" href="/ui/documentacao">Documentação</a>
     </div>
   </div>
 </nav>
@@ -3423,7 +3485,7 @@ def ui_processo(cnj: str):
 
     <div class="row g-3">
       <!-- Sidebar -->
-      <div class="col-lg-4">
+      <div class="col-lg-4 col-xl-3">
         <div class="sticky-side">
           <div class="side-card p-3 mb-3" id="side-summary">
             <div id="bn-summary" class="inline-banner"></div>
@@ -3488,7 +3550,7 @@ def ui_processo(cnj: str):
       </div>
 
       <!-- Main -->
-      <div class="col-lg-8">
+      <div class="col-lg-8 col-xl-9">
         <ul class="nav nav-tabs mb-3" role="tablist">
           <li class="nav-item" role="presentation">
             <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#pane-capa" type="button" role="tab">Capa</button>
@@ -3500,10 +3562,10 @@ def ui_processo(cnj: str):
             <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-pedmult" type="button" role="tab">Pedidos &amp; Multas</button>
           </li>
           <li class="nav-item" role="presentation">
-            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-movs" type="button" role="tab">Movimentações</button>
+            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-docs" type="button" role="tab">Documentos</button>
           </li>
           <li class="nav-item" role="presentation">
-            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-docs" type="button" role="tab">Documentos</button>
+            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#pane-movs" type="button" role="tab">Movimentações</button>
           </li>
         </ul>
 
@@ -3521,25 +3583,61 @@ def ui_processo(cnj: str):
           <div class="tab-pane fade" id="pane-pedmult" role="tabpanel">
             <div id="bn-pedmult" class="inline-banner mb-2"></div>
 
-            <div class="d-flex justify-content-between align-items-center mb-2">
-              <div class="muted small">Extraído da capa (quando disponível) e apresentado de forma consolidada.</div>
+            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+              <div class="muted small">Extraído da capa, movimentações e documentos (quando disponíveis) e apresentado de forma consolidada.</div>
               <button class="btn btn-outline-primary btn-mini" id="btn-pedmult-refresh">Recarregar</button>
             </div>
 
-            <div id="valor-causa-box"></div>
-            <div id="peticao-box"></div>
+            <ul class="nav nav-pills gap-2 mb-3" id="pedmult-subtabs" role="tablist">
+              <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="pm-tab-valores" data-bs-toggle="pill" data-bs-target="#pm-pane-valores" type="button" role="tab">Valores &amp; Custas</button>
+              </li>
+              <li class="nav-item" role="presentation">
+                <button class="nav-link" id="pm-tab-pedidos" data-bs-toggle="pill" data-bs-target="#pm-pane-pedidos" type="button" role="tab">Pedidos</button>
+              </li>
+              <li class="nav-item" role="presentation">
+                <button class="nav-link" id="pm-tab-multas" data-bs-toggle="pill" data-bs-target="#pm-pane-multas" type="button" role="tab">Multas</button>
+              </li>
+            </ul>
 
-            <div class="row g-2">
-              <div class="col-lg-6">
-                <div class="card p-3" id="pedidos-box"><span class="muted">Carregando pedidos…</span></div>
+            <div class="tab-content">
+              <div class="tab-pane fade show active" id="pm-pane-valores" role="tabpanel">
+                <div class="card p-3" id="valores-box" style="min-height:420px;"><span class="muted">Carregando valores…</span></div>
               </div>
-              <div class="col-lg-6">
-                <div class="card p-3" id="multas-box"><span class="muted">Carregando multas…</span></div>
+              <div class="tab-pane fade" id="pm-pane-pedidos" role="tabpanel">
+                <div class="card p-3" id="pedidos-box" style="min-height:420px;"><span class="muted">Carregando pedidos…</span></div>
+              </div>
+              <div class="tab-pane fade" id="pm-pane-multas" role="tabpanel">
+                <div class="card p-3" id="multas-box" style="min-height:420px;"><span class="muted">Carregando multas…</span></div>
               </div>
             </div>
-
-            <div id="valores-movs-box" class="mt-2"></div>
           </div>
+          <div class="tab-pane fade" id="pane-docs" role="tabpanel">
+            <div id="bn-docs" class="inline-banner mb-2"></div>
+            <div class="card p-3">
+              <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
+                <div class="side-title mb-0">Documentos</div>
+                <div class="d-flex gap-2 flex-wrap">
+                  <div class="btn-group" role="group" aria-label="tipo docs">
+                    <input type="radio" class="btn-check" name="docsTipo" id="docsTipoPub" autocomplete="off" checked>
+                    <label class="btn btn-outline-secondary btn-sm" for="docsTipoPub">Públicos</label>
+
+                    <input type="radio" class="btn-check" name="docsTipo" id="docsTipoAutos" autocomplete="off">
+                    <label class="btn btn-outline-secondary btn-sm" for="docsTipoAutos">Autos</label>
+                  </div>
+                  <button class="btn btn-outline-primary btn-sm" id="btn-docs-refresh">Recarregar</button>
+                  <button class="btn btn-brand btn-sm" id="btn-docs-update">Atualizar no tribunal</button>
+                </div>
+              </div>
+
+              <div class="muted small mb-2">
+                Público: baixa documentos públicos. Autos: exige autenticação/certificado na conta do Escavador.
+              </div>
+
+              <div id="docs-box"><span class="muted">Selecione e carregue…</span></div>
+            </div>
+          </div>
+
 
           <div class="tab-pane fade" id="pane-movs" role="tabpanel">
             <div id="bn-movs" class="inline-banner mb-2"></div>
@@ -3567,50 +3665,6 @@ def ui_processo(cnj: str):
               <button class="btn btn-outline-primary btn-mini" id="next">Próxima</button>
             </div>
           </div>
-
-          <div class="tab-pane fade" id="pane-docs" role="tabpanel">
-            <div id="bn-docs" class="inline-banner mb-2"></div>
-            <div class="card p-3">
-              <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
-                <div class="side-title mb-0">Documentos</div>
-                <div class="d-flex gap-2 flex-wrap">
-                  <div class="btn-group" role="group" aria-label="tipo docs">
-                    <input type="radio" class="btn-check" name="docsTipo" id="docsTipoPub" autocomplete="off" checked>
-                    <label class="btn btn-outline-secondary btn-sm" for="docsTipoPub">Públicos</label>
-
-                    <input type="radio" class="btn-check" name="docsTipo" id="docsTipoAutos" autocomplete="off">
-                    <label class="btn btn-outline-secondary btn-sm" for="docsTipoAutos">Autos</label>
-                  </div>
-                  <button class="btn btn-outline-primary btn-sm" id="btn-docs-refresh">Recarregar</button>
-                  <button class="btn btn-brand btn-sm" id="btn-docs-update">Atualizar no tribunal</button>
-                </div>
-              </div>
-
-              <div class="muted small mb-2">
-                Público: baixa documentos públicos. Autos: exige autenticação/certificado na conta do Escavador.
-              </div>
-
-              <div id="autos-creds-panel" class="card p-2 mb-2 border-secondary" style="display:none;">
-                <div class="muted small mb-2 fw-semibold">Credenciais para Autos (obrigatório)</div>
-                <div class="row g-2">
-                  <div class="col-sm-4">
-                    <label class="form-label small muted" for="autosUsuario">Usuário Escavador</label>
-                    <input id="autosUsuario" type="text" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="usuário">
-                  </div>
-                  <div class="col-sm-4">
-                    <label class="form-label small muted" for="autosSenha">Senha Escavador</label>
-                    <input id="autosSenha" type="password" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="senha">
-                  </div>
-                  <div class="col-sm-4">
-                    <label class="form-label small muted" for="autosCertId">ID do Certificado (opcional)</label>
-                    <input id="autosCertId" type="number" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="ex: 123">
-                  </div>
-                </div>
-              </div>
-
-              <div id="docs-box"><span class="muted">Selecione e carregue…</span></div>
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -3628,6 +3682,17 @@ function esc(s){
 }
 
 // Converte valores vindos da API (que às vezes são objetos) em texto amigável
+function safeMoney(v){
+  if(v === null || v === undefined || v === "") return "";
+  if(typeof v === "number"){
+    try{ return new Intl.NumberFormat("pt-BR", {style:"currency", currency:"BRL"}).format(v); }catch(e){ return String(v); }
+  }
+  var s = safeText(v);
+  if(!s) return "";
+  var m = s.match(new RegExp("R\\$\\s*\\d{1,3}(?:\\.\\d{3})*,\\d{2}|\\d{1,3}(?:\\.\\d{3})*,\\d{2}"));
+  return m ? m[0].trim() : s;
+}
+
 function safeText(v){
   if(v === null || v === undefined) return "";
   if(typeof v === "number") return String(v);
@@ -3722,6 +3787,14 @@ function kpi(label, value, action){
   var wrap = (txt && txt.length > 12) ? ' wrap' : '';
   return '<div class="col-6 col-lg-3"><div class="' + cls + '"' + attrs + '><div class="label">' + esc(label) + '</div><div class="value' + wrap + '">' + esc(txt || "") + '</div></div></div>';
 }
+function kpiSummary(label, value, action){
+  var txt = safeText(value);
+  var act = action ? String(action) : "";
+  var cls = act ? "kpi kpi-click" : "kpi";
+  var attrs = act ? (' role="button" tabindex="0" data-action="' + esc(act) + '"') : "";
+  var wrap = (txt && txt.length > 12) ? ' wrap' : '';
+  return '<div class="col-6"><div class="' + cls + '"' + attrs + '><div class="label">' + esc(label) + '</div><div class="value' + wrap + '">' + esc(txt || "") + '</div></div></div>';
+}
 function activateTab(target){
   try{
     var btn = document.querySelector('button[data-bs-target="' + target + '"]');
@@ -3773,12 +3846,6 @@ function safeDateStr(s){
   if(!s) return "";
   var m = ("" + s).match(/^(\\d{4}-\\d{2}-\\d{2})/);
   return m ? m[1] : "";
-}
-function fmtDt(v){
-  if(!v) return "-";
-  var m = String(v).match(/^(\\d{4})-(\\d{2})-(\\d{2})/);
-  if(m) return m[3] + "/" + m[2] + "/" + m[1];
-  return String(v).replace("T"," ").slice(0,19);
 }
 function todayStrLocal(){
   var d = new Date();
@@ -3918,8 +3985,8 @@ async function loadCapaPalatavel(){
 
   // Sidebar summary
   var resumoHtml = ""
-    + "<div class='d-flex justify-content-between align-items-start gap-2'>"
-    + "  <div>"
+    + "<div class='summary-head'>"
+    + "  <div class='summary-main'>"
     + "    <div class='muted small'>Resumo</div>"
     + "    <div class='side-title mono'>" + esc(d.numero_cnj || CNJ) + "</div>"
     + "  </div>"
@@ -3932,11 +3999,11 @@ async function loadCapaPalatavel(){
     + chip("UF", d.estado_origem)
     + "</div>"
     + "<hr class='divider'>"
-    + "<div class='row g-2'>"
-    + kpi("Movs", d.quantidade_movimentacoes || "", "movs")
-    + kpi("Última mov", formatDateBR(d.data_ultima_movimentacao || ""), "ultima")
-    + kpi("Verificado", formatDateBR(d.data_ultima_verificacao || ""), "verificado")
-    + kpi("Fontes", fontes.length, "fontes")
+    + "<div class='row g-2 summary-metrics'>"
+    + kpiSummary("Movimentações", d.quantidade_movimentacoes || "", "movs")
+    + kpiSummary("Última movimentação", formatDateBR(d.data_ultima_movimentacao || ""), "ultima")
+    + kpiSummary("Verificação", formatDateBR(d.data_ultima_verificacao || ""), "verificado")
+    + kpiSummary("Fontes", fontes.length, "fontes")
     + "</div>"
     + "<div class='muted small mt-2'>Dica: use os chips de tipo para focar a timeline.</div>";
 
@@ -4106,6 +4173,158 @@ function renderTimeline(items){
   return html;
 }
 
+
+async function loadDocs(){
+  clearInlineBanner("bn-docs");
+  var box = document.getElementById("docs-box");
+  if(!box) return;
+  var tipo = document.getElementById("docsTipoAutos") && document.getElementById("docsTipoAutos").checked ? "autos" : "publicos";
+  box.innerHTML = '<div class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando documentos…</div>';
+
+  var r=null, j=null;
+  try{
+    r = await fetch("/ui/api/processo/" + encodeURIComponent(CNJ) + "/documentos?tipo=" + encodeURIComponent(tipo));
+    try { j = await r.json(); } catch(_e){ j = { ok:false, error:"RESPOSTA_INVALIDA", message:"Resposta não-JSON do servidor." }; }
+  }catch(e){
+    showInlineBanner("bn-docs","danger","Falha ao carregar documentos", esc(e.toString()));
+    box.innerHTML = '<div class="muted">Sem documentos.</div>';
+    return;
+  }
+
+  if(!j.ok){
+    showInlineBanner("bn-docs","warning","Documentos indisponíveis", esc(j.message || j.error || ("HTTP " + (r ? r.status : ""))));
+    box.innerHTML = '<div class="muted">Sem documentos.</div>';
+    return;
+  }
+
+  var items = j.items || [];
+  if(!Array.isArray(items) || items.length === 0){
+    var hint = "Nenhum documento encontrado no cache.";
+    if(j.warning) hint += " " + esc(j.warning);
+    var extra = tipo==="autos"
+      ? "Autos podem exigir login, senha ou certificado configurados no Escavador para o tribunal deste processo."
+      : "Se a atualização já foi solicitada, o tribunal ou o Escavador ainda podem estar processando os documentos públicos.";
+    box.innerHTML = "<div class='docs-note'>"
+      + "<div class='fw-semibold mb-1'>Ainda sem documentos disponíveis</div>"
+      + "<div class='small text-muted mb-2'>" + hint + "</div>"
+      + "<ul class='small mb-0 ps-3'>"
+      + "<li>Use <b>Atualizar no tribunal</b> e aguarde a conclusão do processamento.</li>"
+      + "<li>Depois clique em <b>Recarregar</b> para consultar o cache novamente.</li>"
+      + "<li>" + extra + "</li>"
+      + "</ul>"
+      + "</div>";
+    return;
+  }
+
+  var html = "";
+  html += "<div class='d-flex justify-content-between align-items-center mb-2'>";
+  html += "  <div class='muted small'>Fonte: " + esc(j.source || "cache") + "</div>";
+  html += "  <div class='muted small'>Itens: " + items.length + "</div>";
+  html += "</div>";
+
+  html += "<div class='list-group'>";
+  for(var i=0;i<items.length;i++){
+    var it = items[i] || {};
+    var key = it.doc_key || it.key || "";
+    var titulo = it.titulo || (it.meta && (it.meta.titulo || it.meta.nome)) || ("Documento " + (i+1));
+    var data = it.data || (it.meta && (it.meta.data || it.meta.data_documento)) || "";
+    var mime = it.mime || (it.meta && (it.meta.mime || it.meta.mime_type)) || "";
+    var dl = "/ui/api/processo/" + encodeURIComponent(CNJ) + "/documentos/" + encodeURIComponent(key) + "/download";
+    html += "<div class='list-group-item'>";
+    html += "  <div class='d-flex justify-content-between align-items-start gap-2'>";
+    html += "    <div>";
+    html += "      <div class='fw-semibold'>" + esc(titulo) + "</div>";
+    html += "      <div class='muted small mono'>" + esc(key) + (data ? (" • " + esc(data)) : "") + (mime ? (" • " + esc(mime)) : "") + "</div>";
+    html += "    </div>";
+    html += "    <div class='text-nowrap'>";
+    if(key){
+      html += "      <a class='btn btn-outline-primary btn-sm' href='" + dl + "' target='_blank'>Download</a>";
+    }else{
+      html += "      <span class='muted small'>Sem chave</span>";
+    }
+    html += "    </div>";
+    html += "  </div>";
+    html += "</div>";
+  }
+  html += "</div>";
+  box.innerHTML = html;
+}
+
+var __docsPollTimer = null;
+var __docsPollTries = 0;
+
+async function pollDocsStatus(tipo){
+  if(__docsPollTimer){ clearInterval(__docsPollTimer); __docsPollTimer = null; }
+  __docsPollTries = 0;
+
+  __docsPollTimer = setInterval(async function(){
+    __docsPollTries += 1;
+    if(__docsPollTries > 30){
+      clearInterval(__docsPollTimer); __docsPollTimer = null;
+      showInlineBanner("bn-docs","warning","Atualização em andamento", "Ainda não finalizou. Você pode recarregar mais tarde.");
+      return;
+    }
+    try{
+      var r = await fetch("/ui/api/processo/" + encodeURIComponent(CNJ) + "/status-atualizacao");
+      var j = await r.json();
+      if(j && j.ok){
+        var st = j.status || {};
+        var sv = (st.status || st.estado || st.situacao || "").toString().toUpperCase();
+        if(sv === "SUCESSO"){
+          clearInterval(__docsPollTimer); __docsPollTimer = null;
+          showInlineBanner("bn-docs","success","Atualização concluída", "Documentos disponíveis. Recarregando…");
+          await loadDocs();
+        }else if(sv === "ERRO" || sv === "FALHA"){
+          clearInterval(__docsPollTimer); __docsPollTimer = null;
+          showInlineBanner("bn-docs","danger","Atualização falhou", esc(JSON.stringify(st).slice(0,400)));
+        }else{
+          showInlineBanner("bn-docs","info","Atualizando…", "Status: " + esc(sv || "PENDENTE"));
+        }
+      }
+    }catch(_e){
+      // ignore
+    }
+  }, 2000);
+}
+
+async function requestDocsUpdate(){
+  clearInlineBanner("bn-docs");
+  var tipo_ui = document.getElementById("docsTipoAutos") && document.getElementById("docsTipoAutos").checked ? "autos" : "publicos";
+  var tipo = (tipo_ui === "autos") ? "autos" : "documentos_publicos";
+
+  showInlineBanner("bn-docs","info","Solicitando atualização…","Enviando requisição para o tribunal via Escavador.");
+
+  try{
+    var r = await fetch("/ui/api/processo/" + encodeURIComponent(CNJ) + "/solicitar-atualizacao", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tipo: tipo })
+    });
+    var j = null;
+    try{ j = await r.json(); }catch(_e){ j = { ok:false, error:"RESPOSTA_INVALIDA", message:"Resposta não-JSON do servidor." }; }
+    if(!j.ok){
+      showInlineBanner("bn-docs","danger","Falha ao solicitar", esc(j.message || j.error || ("HTTP " + r.status)));
+      return;
+    }
+    if(j.already_running || j.pending){
+      var pendingMsg = j.already_running
+        ? "O Escavador informou que a atualização já estava em andamento. Vou acompanhar o status."
+        : "Solicitação aceita. Aguardando processamento…";
+      if(tipo_ui === "autos"){
+        pendingMsg += " Autos podem exigir credenciais ou certificado do tribunal.";
+      }
+      showInlineBanner("bn-docs","info", j.already_running ? "Atualização já em andamento" : "Atualização solicitada", esc(pendingMsg));
+      await pollDocsStatus(tipo_ui);
+      return;
+    }
+    showInlineBanner("bn-docs","info","Atualização solicitada","Aguardando processamento…");
+    await pollDocsStatus(tipo_ui);
+  }catch(e){
+    showInlineBanner("bn-docs","danger","Falha ao solicitar", esc(e.toString()));
+  }
+}
+
+
 async function loadMovs(){
   clearInlineBanner("bn-movs");
   var box = document.getElementById("movs-box");
@@ -4162,161 +4381,165 @@ function objToPairs(o){
   return keys.map(function(k){ return [k, o[k]]; });
 }
 
-function renderCards(title, items){
-  var arr = Array.isArray(items) ? items : [];
-  if(arr.length === 0){
-    return "<div class='d-flex justify-content-between align-items-center mb-2'>"
-      + "<div class='h6 mb-0'>" + esc(title) + "</div>"
-      + "<span class='badge-soft p-2'>0</span>"
-      + "</div>"
-      + "<div class='muted'>Nada encontrado.</div>";
-  }
-  var html = "<div class='d-flex justify-content-between align-items-center mb-2'>"
+function cardHeader(title, count){
+  return "<div class='d-flex justify-content-between align-items-center mb-2'>"
     + "<div class='h6 mb-0'>" + esc(title) + "</div>"
-    + "<span class='badge-soft p-2'>" + esc(String(arr.length)) + "</span>"
+    + "<span class='badge-soft p-2'>" + esc(String(count)) + "</span>"
     + "</div>";
-  html += "<div class='d-grid gap-2'>";
+}
+
+function tagChip(text){
+  var t = safeText(text);
+  if(!t) return "";
+  return "<span style='display:inline-block;padding:4px 8px;border:1px solid var(--border);border-radius:999px;background:rgba(48,80,160,.05);font-size:12px;'>" + esc(t) + "</span>";
+}
+
+function excelHeader(title, count, columns){
+  var cols = Array.isArray(columns) ? columns : [];
+  var html = cardHeader(title, count);
+  html += "<div style='overflow:auto;border:1px solid var(--border);border-radius:16px;background:#fff;'>";
+  html += "<table class='table table-sm align-middle mb-0' style='min-width:980px;'>";
+  html += "<thead style='position:sticky;top:0;background:#f7f9fc;z-index:1;'><tr>";
+  for(var i=0;i<cols.length;i++){
+    var align = cols[i] === 'Valor' ? "right" : 'left';
+    html += "<th style='white-space:nowrap;padding:12px 10px;border-bottom:1px solid var(--border);text-align:" + align + ";font-size:12px;color:#5b6b86;text-transform:uppercase;letter-spacing:.03em;'>" + esc(cols[i]) + "</th>";
+  }
+  html += "</tr></thead><tbody>";
+  return html;
+}
+
+function excelFooter(){
+  return "</tbody></table></div>";
+}
+
+function tdCell(value, opts){
+  opts = opts || {};
+  var align = opts.align || 'left';
+  var nowrap = opts.nowrap ? ';white-space:nowrap;' : '';
+  var mono = opts.mono ? 'mono' : '';
+  return "<td class='" + mono + "' style='padding:10px;border-bottom:1px solid #eef2f7;text-align:" + align + nowrap + "vertical-align:top;'>" + (value || "<span class='muted'>-</span>") + "</td>";
+}
+
+function compactText(s, max){
+  var t = safeText(s || '');
+  max = max || 180;
+  if(!t) return '';
+  return t.length > max ? t.slice(0, max-1) + '…' : t;
+}
+
+function renderStandardCards(title, items){
+  var arr = Array.isArray(items) ? items : [];
+  if(arr.length === 0) return cardHeader(title, 0) + "<div class='muted'>Nada encontrado.</div>";
+  var html = excelHeader(title, arr.length, ['Tipo', 'Descrição', 'Origem', 'Data', 'Trecho']);
   for(var i=0;i<arr.length;i++){
     var it = arr[i];
-    if(typeof it === "string" || typeof it === "number" || typeof it === "boolean"){
-      html += "<div class='p-2' style='border:1px solid var(--border); border-radius:14px; background:rgba(48,80,160,.03);'>"
-           + "<div class='wrap'>" + esc(String(it)) + "</div></div>";
-      continue;
+    var tipo = '';
+    var descricao = '';
+    var origem = '';
+    var data = '';
+    var trecho = '';
+    if(typeof it === 'string' || typeof it === 'number' || typeof it === 'boolean'){
+      descricao = String(it);
+      trecho = descricao;
+    } else if(it && typeof it === 'object'){
+      tipo = safeText(it.tipo || it.pedido || it.multa || '');
+      descricao = safeText(it.descricao || it.texto || '');
+      origem = safeText(it.origem || '');
+      data = safeText(it.data || '');
+      trecho = safeText(it.trecho || it.contexto || it.texto || it.descricao || '');
+      if(!tipo && !descricao && !trecho){
+        trecho = JSON.stringify(it);
+      }
+    } else {
+      descricao = 'Item inválido';
     }
-    if(!it || typeof it !== "object"){
-      html += "<div class='p-2 muted' style='border:1px solid var(--border); border-radius:14px;'>Item inválido</div>";
-      continue;
-    }
-    var pairs = objToPairs(it);
-    var head = "";
-    var titleGuess = safeText(it.descricao || it.pedido || it.multa || it.tipo || "");
-    if(titleGuess){
-      head = "<div style='font-weight:800' class='mb-1'>" + esc(titleGuess) + "</div>";
-    }
-    var rows = "";
-    for(var p=0;p<pairs.length;p++){
-      var k = pairs[p][0];
-      var v = pairs[p][1];
-      if(v === null || v === undefined || v === "") continue;
-      var vv = (String(k).toLowerCase().includes("valor")) ? safeMoney(v) : safeText(v);
-      if(!vv) continue;
-      rows += "<div class='d-flex justify-content-between gap-2 py-1' style='border-top:1px dashed rgba(0,0,0,.08);'>"
-           + "<div class='muted small' style='min-width:120px'>" + esc(k) + "</div>"
-           + "<div class='mono small text-end wrap' style='max-width:70%'>" + esc(vv) + "</div>"
-           + "</div>";
-    }
-    if(!rows){
-      rows = "<div class='muted small'>Sem campos estruturados; exibindo JSON.</div>"
-           + "<pre class='small mb-0'>" + esc(JSON.stringify(it, null, 2)) + "</pre>";
-    }
-    html += "<div class='p-2' style='border:1px solid var(--border); border-radius:14px; background:rgba(48,80,160,.03);'>"
-         + head + rows + "</div>";
+    html += '<tr>'
+      + tdCell(esc(tipo || title.slice(0,-1) || 'Item'), {nowrap:true})
+      + tdCell("<div class='wrap'>" + esc(compactText(descricao, 140)) + "</div>")
+      + tdCell(origem ? tagChip(origem) : '')
+      + tdCell(esc(data), {nowrap:true})
+      + tdCell("<div class='wrap small'>" + esc(compactText(trecho, 240)) + "</div>")
+      + '</tr>';
   }
-  html += "</div>";
+  html += excelFooter();
   return html;
+}
+
+function renderValueCards(title, items){
+  var arr = Array.isArray(items) ? items : [];
+  if(arr.length === 0) return cardHeader(title, 0) + "<div class='muted'>Nada encontrado.</div>";
+  var html = excelHeader(title, arr.length, ['Tipo', 'Valor', 'Descrição', 'Origem', 'Data', 'Trecho']);
+  for(var i=0;i<arr.length;i++){
+    var it = arr[i] || {};
+    if(typeof it !== 'object'){
+      it = { tipo: 'Valor', valor: safeMoney(it), descricao: String(it), trecho: String(it) };
+    }
+    var tipo = safeText(it.tipo || 'Valor');
+    var descricao = safeText(it.descricao || '');
+    var valor = safeMoney(it.valor_formatado || it.valor || '');
+    var origem = safeText(it.origem || '');
+    var data = safeText(it.data || '');
+    var trecho = safeText(it.trecho || it.contexto || it.descricao || '');
+    html += '<tr>'
+      + tdCell("<strong>" + esc(tipo) + "</strong>", {nowrap:true})
+      + tdCell(valor ? esc(valor) : '', {align:'right', nowrap:true, mono:true})
+      + tdCell("<div class='wrap'>" + esc(compactText(descricao, 140)) + "</div>")
+      + tdCell(origem ? tagChip(origem) : '')
+      + tdCell(esc(data), {nowrap:true})
+      + tdCell("<div class='wrap small'>" + esc(compactText(trecho, 240)) + "</div>")
+      + '</tr>';
+  }
+  html += excelFooter();
+  return html;
+}
+
+function renderCards(title, items){
+  return (title === 'Valores & Custas') ? renderValueCards(title, items) : renderStandardCards(title, items);
 }
 
 async function loadPedidosMultas(force){
   clearInlineBanner("bn-pedmult");
   var pedidosBox = document.getElementById("pedidos-box");
   var multasBox = document.getElementById("multas-box");
-  var valorCausaBox = document.getElementById("valor-causa-box");
-  var valoresMovsBox = document.getElementById("valores-movs-box");
-  var peticaoBox = document.getElementById("peticao-box");
+  var valoresBox = document.getElementById("valores-box");
   pedidosBox.innerHTML = '<span class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando…</span>';
   multasBox.innerHTML  = '<span class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando…</span>';
-  if(valorCausaBox) valorCausaBox.innerHTML = "";
-  if(valoresMovsBox) valoresMovsBox.innerHTML = "";
-  if(peticaoBox) peticaoBox.innerHTML = "";
+  valoresBox.innerHTML = '<span class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando…</span>';
 
   try{
     var url = "/ui/api/processo/" + encodeURIComponent(CNJ) + "/pedidos-multas";
     if(force) url += "?refresh=1";
     var r = await fetch(url);
-    var j = await r.json();
+    var raw = await r.text();
+    var j = {};
+    try{ j = JSON.parse(raw); } catch(parseErr){
+      showInlineBanner("bn-pedmult","danger","Falha ao carregar","Resposta não-JSON do servidor.");
+      pedidosBox.innerHTML = "<div class='muted'>Falha.</div>";
+      multasBox.innerHTML = "<div class='muted'>Falha.</div>";
+      valoresBox.innerHTML = "<div class='muted'>Falha.</div>";
+      return;
+    }
     if(!j.ok){
       var msg = esc(j.message || j.error || ("HTTP " + r.status));
       showInlineBanner("bn-pedmult","warning","Falha ao carregar", msg);
       pedidosBox.innerHTML = "<div class='muted'>Sem dados.</div>";
       multasBox.innerHTML = "<div class='muted'>Sem dados.</div>";
+      valoresBox.innerHTML = "<div class='muted'>Sem dados.</div>";
       return;
     }
-
-    // Valor da Causa
-    if(valorCausaBox){
-      if(j.valor_causa){
-        valorCausaBox.innerHTML = "<div class='card p-3 mb-2' style='border-left:4px solid var(--accent);'>"
-          + "<div class='muted small mb-1'>Valor da Causa</div>"
-          + "<div style='font-size:1.4rem;font-weight:800;color:var(--accent)'>" + esc(j.valor_causa) + "</div>"
-          + "</div>";
-      } else {
-        valorCausaBox.innerHTML = "<div class='muted small mb-2'>Valor da causa não encontrado na capa.</div>";
-      }
-    }
-
-    // Pedidos e Multas
     pedidosBox.innerHTML = renderCards("Pedidos", j.pedidos || []);
     multasBox.innerHTML = renderCards("Multas", j.multas || []);
-    if((j.pedidos||[]).length === 0 && (j.multas||[]).length === 0){
-      // Só mostrar o banner se também não há valor_causa nem valores_movs
-      if(!j.valor_causa && !(j.valores_movs && j.valores_movs.length > 0)){
-        showInlineBanner("bn-pedmult","info","Sem registros","A capa não retornou pedidos/multas para este CNJ (ou a fonte não disponibiliza).");
-      }
+    valoresBox.innerHTML = renderCards("Valores & Custas", j.valores || []);
+    if((j.pedidos||[]).length === 0 && (j.multas||[]).length === 0 && (j.valores||[]).length === 0){
+      showInlineBanner("bn-pedmult","info","Sem registros","Não localizei pedidos, multas ou valores relevantes na capa, nas movimentações ou nos documentos já disponíveis para este CNJ.");
     } else if(j.cached){
       try{ showToast("info","Pedidos & Multas", j.stale ? "Cache (stale) usado" : "Cache usado", 2200); }catch(e){}
     }
-
-    // Valores nas Movimentações
-    if(valoresMovsBox){
-      var movs = j.valores_movs || [];
-      if(movs.length > 0){
-        var movsHtml = "<div class='card p-3 mb-2'><div style='font-weight:700' class='mb-2'>Valores encontrados nas Movimentações</div><div class='d-flex flex-column gap-2'>";
-        for(var i=0;i<movs.length;i++){
-          var m = movs[i];
-          var valorOrKeyword = "";
-          if(m.valor){
-            valorOrKeyword = "<span class='mono' style='font-weight:700;color:var(--accent)'>" + esc(m.valor) + "</span>";
-          } else if(m.keyword){
-            valorOrKeyword = "<span class='badge' style='background:var(--border);color:var(--text-muted);font-size:0.75rem;border-radius:6px;padding:2px 8px;font-weight:600'>" + esc(m.keyword) + "</span>";
-          }
-          movsHtml += "<div style='border:1px solid var(--border);border-radius:10px;padding:8px 12px;'>"
-            + "<div class='d-flex justify-content-between'>"
-            + "<span class='muted small'>" + esc(m.data||"") + "</span>"
-            + valorOrKeyword
-            + "</div>"
-            + "<div class='small mt-1 wrap'>" + esc(m.descricao||"") + "</div>"
-            + "</div>";
-        }
-        movsHtml += "</div></div>";
-        valoresMovsBox.innerHTML = movsHtml;
-      } else {
-        valoresMovsBox.innerHTML = "<div class='muted small mb-2'>Nenhum valor monetário encontrado nas movimentações.</div>";
-      }
-    }
-
-    // Petição Inicial / Documentos
-    if(peticaoBox){
-      if(j.has_docs_publicos){
-        peticaoBox.innerHTML = "<div class='alert alert-info py-2 px-3 mb-2 small'>"
-          + "📄 <strong>Petição Inicial disponível:</strong> Consulte a aba "
-          + "<a href='#' id='link-goto-docs'>Documentos</a>"
-          + " para ver a Petição Inicial com o valor da causa e pedidos detalhados."
-          + "</div>";
-        var linkDocs = document.getElementById("link-goto-docs");
-        if(linkDocs){
-          linkDocs.addEventListener("click", function(ev){
-            ev.preventDefault();
-            var tab = document.querySelector('[data-bs-target="#pane-docs"]');
-            if(tab) tab.click();
-          });
-        }
-      }
-    }
-
   } catch(e){
     showInlineBanner("bn-pedmult","danger","Erro ao carregar", esc(e.toString()));
     pedidosBox.innerHTML = "<div class='muted'>Falha.</div>";
     multasBox.innerHTML = "<div class='muted'>Falha.</div>";
+    valoresBox.innerHTML = "<div class='muted'>Falha.</div>";
   }
 }
 document.getElementById("prev").addEventListener("click", function(){
@@ -4370,171 +4593,28 @@ document.getElementById("btn-sync").addEventListener("click", async function(){
   }
 });
 
-async function loadDocs(){
-  clearInlineBanner("bn-docs");
-  var box = document.getElementById("docs-box");
-  if(!box) return;
-  var tipo = document.getElementById("docsTipoAutos") && document.getElementById("docsTipoAutos").checked ? "autos" : "publicos";
-  box.innerHTML = '<div class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando documentos…</div>';
 
-  var r=null, j=null;
-  try{
-    r = await fetch("/ui/api/processo/" + encodeURIComponent(CNJ) + "/documentos?tipo=" + encodeURIComponent(tipo));
-    try { j = await r.json(); } catch(_e){ j = { ok:false, error:"RESPOSTA_INVALIDA", message:"Resposta não-JSON do servidor." }; }
-  }catch(e){
-    showInlineBanner("bn-docs","danger","Falha ao carregar documentos", esc(e.toString()));
-    box.innerHTML = '<div class="muted">Sem documentos.</div>';
-    return;
-  }
+// Documentos tab
+try{
+  var btnDocsRefresh = document.getElementById("btn-docs-refresh");
+  if(btnDocsRefresh) btnDocsRefresh.addEventListener("click", function(){ loadDocs(); });
 
-  if(!j.ok){
-    showInlineBanner("bn-docs","warning","Documentos indisponíveis", esc(j.message || j.error || ("HTTP " + (r ? r.status : ""))));
-    box.innerHTML = '<div class="muted">Sem documentos.</div>';
-    return;
-  }
+  var btnDocsUpdate = document.getElementById("btn-docs-update");
+  if(btnDocsUpdate) btnDocsUpdate.addEventListener("click", function(){ requestDocsUpdate(); });
 
-  var items = j.items || [];
-  if(!Array.isArray(items) || items.length === 0){
-    var hint = "Nenhum documento encontrado no cache.";
-    if(j.warning) hint += " " + esc(j.warning);
-    hint += " Se você acabou de adicionar o processo, clique em <b>Atualizar no tribunal</b> para baixar " + (tipo==="autos" ? "os autos" : "documentos públicos") + ".";
-    box.innerHTML = "<div class='muted'>" + hint + "</div>";
-    return;
-  }
+  var rdPub = document.getElementById("docsTipoPub");
+  var rdAutos = document.getElementById("docsTipoAutos");
+  if(rdPub) rdPub.addEventListener("change", function(){ loadDocs(); });
+  if(rdAutos) rdAutos.addEventListener("change", function(){ loadDocs(); });
 
-  items.sort(function(a, b){
-    var da = a.data_disponibilizacao || a.dataDisponibilizacao || a.data || (a.meta && (a.meta.data || a.meta.data_documento || a.meta.data_disponibilizacao)) || "";
-    var db = b.data_disponibilizacao || b.dataDisponibilizacao || b.data || (b.meta && (b.meta.data || b.meta.data_documento || b.meta.data_disponibilizacao)) || "";
-    da = (da && typeof da === "object") ? (da.data || da.data_documento || da.dataHora || da.data_hora || "") : da;
-    db = (db && typeof db === "object") ? (db.data || db.data_documento || db.dataHora || db.data_hora || "") : db;
-    if(!da && !db) return 0;
-    if(!da) return 1;
-    if(!db) return -1;
-    return db.localeCompare(da);
-  });
-
-  var html = "";
-  html += "<div class='d-flex justify-content-between align-items-center mb-2'>";
-  html += "  <div class='muted small'>Fonte: " + esc(j.source || "cache") + "</div>";
-  html += "  <div class='muted small'>Itens: " + items.length + "</div>";
-  html += "</div>";
-
-  html += "<div class='list-group'>";
-  for(var i=0;i<items.length;i++){
-    var it = items[i] || {};
-    var key = it.doc_key || it.key || "";
-    var titulo = it.titulo || it.descricao || (it.meta && (it.meta.titulo || it.meta.nome)) || ("Documento " + (i+1));
-    var dataRaw = it.data_disponibilizacao || it.dataDisponibilizacao || it.data || (it.meta && (it.meta.data || it.meta.data_documento || it.meta.data_disponibilizacao)) || "";
-    var dataStr = (dataRaw && typeof dataRaw === "object") ? (dataRaw.data || dataRaw.data_documento || dataRaw.dataHora || dataRaw.data_hora || "") : dataRaw;
-    var tipo = it.tipo || (it.meta && it.meta.tipo) || "";
-    var ext = it.extensao_arquivo || (it.meta && it.meta.extensao_arquivo) || "";
-    var mime = it.mime || (it.meta && (it.meta.mime || it.meta.mime_type)) || "";
-    var paginas = (it.quantidade_paginas != null) ? it.quantidade_paginas : "";
-    var formato = ext || mime || "";
-    var dlParams = new URLSearchParams();
-    if(dataStr) dlParams.set("data", dataStr);
-    if(tipo) dlParams.set("tipo", tipo);
-    if(ext) dlParams.set("ext", ext);
-    var dlBase = "/ui/api/processo/" + encodeURIComponent(CNJ) + "/documentos/" + encodeURIComponent(key);
-    var dl = dlBase + "/download?" + dlParams.toString();
-    var previewUrl = dlBase + "/preview";
-    var metaParts = [];
-    if(tipo) metaParts.push(esc(tipo));
-    if(formato) metaParts.push(esc(formato));
-    if(paginas !== "") metaParts.push(paginas + " pág.");
-    html += "<div class='list-group-item'>";
-    html += "  <div class='d-flex justify-content-between align-items-start gap-2'>";
-    html += "    <div>";
-    html += "      <div class='fw-semibold'>" + esc(titulo) + "</div>";
-    html += "      <div class='muted small'>📅 " + esc(fmtDt(dataStr)) + "</div>";
-    html += "      <div class='muted small'>" + (metaParts.length ? metaParts.join(" · ") : "—") + "</div>";
-    html += "    </div>";
-    html += "    <div class='text-nowrap d-flex gap-1'>";
-    if(key){
-      html += "      <button class='btn btn-outline-secondary btn-sm' onclick=\\"openPreview('" + previewUrl.replace(/'/g, "%27") + "', '" + esc(titulo).replace(/'/g, "\\'") + "')\\">👁 Pré-visualizar</button>";
-      html += "      <a class='btn btn-outline-primary btn-sm' href='" + dl + "' target='_blank'>⬇ Download</a>";
-    }else{
-      html += "      <span class='muted small'>Sem chave</span>";
-    }
-    html += "    </div>";
-    html += "  </div>";
-    html += "</div>";
-  }
-  html += "</div>";
-  box.innerHTML = html;
-}
-
-var __docsPollTimer = null;
-var __docsPollTries = 0;
-
-async function pollDocsStatus(tipo){
-  if(__docsPollTimer){ clearInterval(__docsPollTimer); __docsPollTimer = null; }
-  __docsPollTries = 0;
-
-  __docsPollTimer = setInterval(async function(){
-    __docsPollTries += 1;
-    if(__docsPollTries > 30){
-      clearInterval(__docsPollTimer); __docsPollTimer = null;
-      showInlineBanner("bn-docs","warning","Atualização em andamento", "Ainda não finalizou. Você pode recarregar mais tarde.");
-      return;
-    }
-    try{
-      var r = await fetch("/ui/api/processo/" + encodeURIComponent(CNJ) + "/status-atualizacao");
-      var j = await r.json();
-      if(j && j.ok){
-        var sv = (j.status || "").toString().toUpperCase();
-        if(sv === "SUCESSO"){
-          clearInterval(__docsPollTimer); __docsPollTimer = null;
-          showInlineBanner("bn-docs","success","Atualização concluída", "Documentos disponíveis. Recarregando…");
-          await loadDocs();
-        }else if(sv === "ERRO" || sv === "FALHA"){
-          clearInterval(__docsPollTimer); __docsPollTimer = null;
-          showInlineBanner("bn-docs","danger","Atualização falhou", esc((j.status_json ? JSON.stringify(j.status_json) : sv).slice(0,400)));
-        }else{
-          showInlineBanner("bn-docs","info","Atualizando…", "Status: " + esc(sv || "PENDENTE"));
-        }
-      }
-    }catch(_e){
-      // ignore
-    }
-  }, 2000);
-}
-
-async function requestDocsUpdate(){
-  clearInlineBanner("bn-docs");
-  var tipo_ui = document.getElementById("docsTipoAutos") && document.getElementById("docsTipoAutos").checked ? "autos" : "publicos";
-  var tipo = (tipo_ui === "autos") ? "autos" : "documentos_publicos";
-
-  showInlineBanner("bn-docs","info","Solicitando atualização…","Enviando requisição para o tribunal via Escavador.");
-
-  var credBody = {};
-  if(tipo_ui === "autos"){
-    var autosUsuario = document.getElementById("autosUsuario");
-    var autosSenha = document.getElementById("autosSenha");
-    var autosCertId = document.getElementById("autosCertId");
-    if(autosUsuario && autosUsuario.value.trim()) credBody.usuario = autosUsuario.value.trim();
-    if(autosSenha && autosSenha.value) credBody.senha = autosSenha.value;
-    if(autosCertId && autosCertId.value.trim()){ var certIdVal = parseInt(autosCertId.value.trim(), 10); if(!isNaN(certIdVal)) credBody.certificado_id = certIdVal; }
-  }
-
-  try{
-    var r = await fetch("/ui/api/processo/" + encodeURIComponent(CNJ) + "/solicitar-atualizacao", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(Object.assign({ tipo: tipo }, credBody))
+  var tabDocsBtn = document.querySelector('button[data-bs-target="#pane-docs"]');
+  if(tabDocsBtn){
+    tabDocsBtn.addEventListener("click", function(){
+      // carrega na primeira abertura
+      setTimeout(loadDocs, 50);
     });
-    var j = null;
-    try{ j = await r.json(); }catch(_e){ j = { ok:false, error:"RESPOSTA_INVALIDA", message:"Resposta não-JSON do servidor." }; }
-    if(!j.ok){
-      showInlineBanner("bn-docs","danger","Falha ao solicitar", esc(j.message || j.error || ("HTTP " + r.status)));
-      return;
-    }
-    showInlineBanner("bn-docs","info","Atualização solicitada","Aguardando processamento…");
-    await pollDocsStatus(tipo_ui);
-  }catch(e){
-    showInlineBanner("bn-docs","danger","Falha ao solicitar", esc(e.toString()));
   }
-}
+}catch(_e){}
 
 async function loadLinkedDocs(){
   clearInlineBanner("bn-linked");
@@ -4645,47 +4725,9 @@ try{
     btnRefresh.addEventListener("click", function(){ loadPedidosMultas(true); });
   }
 }catch(e){}
-
-// Documentos tab
-try{
-  var btnDocsRefresh = document.getElementById("btn-docs-refresh");
-  if(btnDocsRefresh) btnDocsRefresh.addEventListener("click", function(){ loadDocs(); });
-
-  var btnDocsUpdate = document.getElementById("btn-docs-update");
-  if(btnDocsUpdate) btnDocsUpdate.addEventListener("click", function(){ requestDocsUpdate(); });
-
-  var rdPub = document.getElementById("docsTipoPub");
-  var rdAutos = document.getElementById("docsTipoAutos");
-  function toggleCredsPanel(){
-    var panel = document.getElementById("autos-creds-panel");
-    if(panel) panel.style.display = (rdAutos && rdAutos.checked) ? "" : "none";
-  }
-  if(rdPub) rdPub.addEventListener("change", function(){ toggleCredsPanel(); loadDocs(); });
-  if(rdAutos) rdAutos.addEventListener("change", function(){ toggleCredsPanel(); loadDocs(); });
-
-  var tabDocsBtn = document.querySelector('button[data-bs-target="#pane-docs"]');
-  if(tabDocsBtn){
-    tabDocsBtn.addEventListener("click", function(){
-      setTimeout(loadDocs, 50);
-    });
-  }
-}catch(_e){}
 loadCapaPalatavel();
 loadMovs();
 loadLinkedDocs();
-(function(){
-  if(document.getElementById("docPreviewModal")) return;
-  var m = document.createElement("div");
-  m.innerHTML = "<div class=\\"modal fade\\" id=\\"docPreviewModal\\" tabindex=\\"-1\\" aria-labelledby=\\"docPreviewLabel\\" aria-hidden=\\"true\\"><div class=\\"modal-dialog modal-xl\\"><div class=\\"modal-content bg-dark text-light\\"><div class=\\"modal-header border-secondary\\"><h5 class=\\"modal-title\\" id=\\"docPreviewLabel\\">Pré-visualização</h5><button type=\\"button\\" class=\\"btn-close btn-close-white\\" data-bs-dismiss=\\"modal\\" aria-label=\\"Fechar\\"></button></div><div class=\\"modal-body p-0\\" style=\\"height:80vh;\\"><iframe id=\\"docPreviewFrame\\" src=\\"\\" style=\\"width:100%;height:100%;border:none;\\"></iframe></div></div></div></div>";
-  document.body.appendChild(m.firstChild);
-})();
-window.openPreview = function(url, titulo){
-  if(typeof url !== "string" || !url.startsWith("/ui/api/processo/")) return;
-  document.getElementById("docPreviewFrame").src = url;
-  document.getElementById("docPreviewLabel").textContent = titulo || "Pré-visualização";
-  var modal = new bootstrap.Modal(document.getElementById("docPreviewModal"));
-  modal.show();
-};
 </script>
     """
 
@@ -4705,7 +4747,7 @@ def ui_api_capa(cnj: str):
 
     def _get_cached():
         try:
-            with db_conn() as conn:
+            with db_connect() as conn:
                 conn.row_factory = sqlite3.Row
                 cur = conn.cursor()
                 cur.execute("SELECT payload, updated_at FROM capa_cache WHERE cnj=?", (cnj,))
@@ -4725,7 +4767,7 @@ def ui_api_capa(cnj: str):
 
     def _set_cached(payload: dict):
         try:
-            with db_conn() as conn:
+            with db_connect() as conn:
                 cur = conn.cursor()
                 cur.execute(
                     "INSERT INTO capa_cache(cnj,payload,updated_at) VALUES(?,?,?) "
@@ -4769,6 +4811,7 @@ def _collect_key_anywhere(obj: Any, keys: set) -> List[Any]:
                 out.extend(_collect_key_anywhere(it, keys))
     return out
 
+
 def _normalize_to_list(v: Any) -> List[Any]:
     if v is None:
         return []
@@ -4777,6 +4820,259 @@ def _normalize_to_list(v: Any) -> List[Any]:
     if isinstance(v, dict):
         return [v]
     return [v]
+
+
+def _flatten_strings(obj: Any, limit: int = 5000) -> List[str]:
+    out: List[str] = []
+
+    def walk(x: Any):
+        if len(out) >= limit:
+            return
+        if x is None:
+            return
+        if isinstance(x, str):
+            s = re.sub(r"\s+", " ", x).strip()
+            if s:
+                out.append(s)
+            return
+        if isinstance(x, (int, float, bool)):
+            out.append(str(x))
+            return
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+            return
+        if isinstance(x, list):
+            for it in x:
+                walk(it)
+
+    walk(obj)
+    return out
+
+
+_PEDIDO_PATTERNS = [
+    (re.compile(r"pedido(?:s)?[:\-\s]*(.{0,180})", re.I), "Pedido"),
+    (re.compile(r"requer(?:eu|imento|imentos)?[:\-\s]*(.{0,180})", re.I), "Requerimento"),
+    (re.compile(r"liminar.{0,180}", re.I), "Liminar"),
+    (re.compile(r"tutela(?:\s+de\s+urg[eê]ncia|\s+antecipada)?.{0,180}", re.I), "Tutela"),
+    (re.compile(r"indeniza[cç][aã]o.{0,180}", re.I), "Indenização"),
+    (re.compile(r"danos?\s+(?:morais|materiais).{0,180}", re.I), "Danos"),
+    (re.compile(r"obriga[cç][aã]o\s+de\s+fazer.{0,180}", re.I), "Obrigação de fazer"),
+    (re.compile(r"embargos?.{0,180}", re.I), "Embargos"),
+    (re.compile(r"execu[cç][aã]o.{0,180}", re.I), "Execução"),
+]
+
+_MULTA_PATTERNS = [
+    (re.compile(r"multa.{0,180}", re.I), "Multa"),
+    (re.compile(r"astreintes.{0,180}", re.I), "Astreintes"),
+    (re.compile(r"cl[aá]usula\s+penal.{0,180}", re.I), "Cláusula penal"),
+    (re.compile(r"40%\s+do\s+fgts.{0,180}", re.I), "Multa FGTS 40%"),
+    (re.compile(r"art(?:igo)?\.?\s*467\s+da\s+clt.{0,180}", re.I), "Multa art. 467 CLT"),
+    (re.compile(r"art(?:igo)?\.?\s*477\s+da\s+clt.{0,180}", re.I), "Multa art. 477 CLT"),
+]
+
+
+_VALOR_PATTERNS = [
+    (re.compile(r"\bcustas?\b.{0,120}", re.I), "Custas"),
+    (re.compile(r"\bhonor[aá]rios?\b.{0,120}", re.I), "Honorários"),
+    (re.compile(r"\bvalor\s+da\s+causa\b.{0,120}", re.I), "Valor da causa"),
+    (re.compile(r"\bindeniza[cç][aã]o\b.{0,120}", re.I), "Indenização"),
+    (re.compile(r"\bcondena[cç][aã]o\b.{0,120}", re.I), "Condenação"),
+    (re.compile(r"\bpenhora\b.{0,120}", re.I), "Penhora"),
+    (re.compile(r"\bbloqueio\b.{0,120}", re.I), "Bloqueio"),
+    (re.compile(r"\bdep[oó]sito\b.{0,120}", re.I), "Depósito"),
+]
+
+_MONEY_RX = re.compile(r"(R\$\s*\d{1,3}(?:\.\d{3})*,\d{2}|R\$\s*\d+,\d{2}|\d{1,3}(?:\.\d{3})*,\d{2})", re.I)
+
+
+
+
+def _maybe_contains_money_or_keyword(text: str) -> bool:
+    if not text:
+        return False
+    s = str(text)
+    low = s.lower()
+    if 'r$' in low:
+        return True
+    if re.search(r"\b\d{1,3}(?:\.\d{3})*,\d{2}\b", s):
+        return True
+    keywords = (
+        'custa', 'honor', 'multa', 'astreinte', 'indeniza', 'condena',
+        'valor da causa', 'penhora', 'bloque', 'sisba', 'bacen', 'depósito', 'deposito'
+    )
+    return any(k in low for k in keywords)
+
+def _extract_money_mentions(text: str, source: str, data_ref: Optional[str] = None) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    base = re.sub(r"\s+", " ", text).strip()
+    out: List[Dict[str, Any]] = []
+    for m in _MONEY_RX.finditer(base):
+        amount = m.group(1).strip()
+        start = max(0, m.start() - 100)
+        end = min(len(base), m.end() + 100)
+        trecho = base[start:end].strip(" .;:-")
+        tipo = "Valor"
+        low = trecho.lower()
+        if "custa" in low:
+            tipo = "Custas"
+        elif "honor" in low:
+            tipo = "Honorários"
+        elif "multa" in low:
+            tipo = "Multa"
+        elif "astreinte" in low:
+            tipo = "Astreintes"
+        elif "indeniza" in low:
+            tipo = "Indenização"
+        elif "valor da causa" in low:
+            tipo = "Valor da causa"
+        elif "condena" in low:
+            tipo = "Condenação"
+        elif "penhor" in low:
+            tipo = "Penhora"
+        elif "bloque" in low or "sisba" in low or "bacen" in low:
+            tipo = "Bloqueio"
+        out.append({
+            "tipo": tipo,
+            "descricao": trecho,
+            "valor": amount if amount.upper().startswith("R$") else f"R$ {amount}",
+            "origem": source,
+            "data": data_ref or "",
+        })
+    return out
+
+
+def _extract_keyword_values(text: str, source: str, data_ref: Optional[str] = None) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    base = re.sub(r"\s+", " ", text).strip()
+    out: List[Dict[str, Any]] = []
+    for rx, label in _VALOR_PATTERNS:
+        for m in rx.finditer(base):
+            trecho = m.group(0).strip(" .;:-")
+            if not trecho:
+                continue
+            money = _MONEY_RX.search(trecho)
+            out.append({
+                "tipo": label,
+                "descricao": trecho,
+                "valor": (money.group(1).strip() if money else ""),
+                "origem": source,
+                "data": data_ref or "",
+            })
+    return out
+
+
+def _extract_matches_from_text(text: str, source: str, kind: str, data_ref: Optional[str] = None) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    patterns = _PEDIDO_PATTERNS if kind == "pedido" else _MULTA_PATTERNS
+    out: List[Dict[str, Any]] = []
+    base = re.sub(r"\s+", " ", text).strip()
+    for rx, label in patterns:
+        for m in rx.finditer(base):
+            trecho = m.group(0).strip(" .;:-")
+            if not trecho:
+                continue
+            out.append({
+                "tipo": label,
+                "descricao": trecho,
+                "origem": source,
+                "data": data_ref or "",
+            })
+    return out
+
+
+def _dedupe_any(items: List[Any]) -> List[Any]:
+    seen = set()
+    out = []
+    for it in items:
+        try:
+            if isinstance(it, (dict, list)):
+                h = stable_hash(it)
+            else:
+                h = stable_hash({"v": str(it)})
+        except Exception:
+            h = str(it)
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append(it)
+    return out
+
+
+def _looks_like_money_scalar(v: Any) -> bool:
+    if v is None:
+        return False
+    s = str(v).strip()
+    if not s:
+        return False
+    if _MONEY_RX.search(s):
+        return True
+    if re.fullmatch(r"\d+[.,]\d{2,4}", s):
+        return True
+    return False
+
+
+def _format_scalar_money(v: Any) -> str:
+    s = str(v).strip()
+    if not s:
+        return ""
+    m = _MONEY_RX.search(s)
+    if m:
+        raw = m.group(1).strip()
+        return raw if raw.upper().startswith("R$") else f"R$ {raw}"
+    if re.fullmatch(r"\d+[.,]\d{2,4}", s):
+        try:
+            num = float(s.replace('.', '').replace(',', '.')) if ',' in s and '.' in s else float(s.replace(',', '.'))
+            inte = int(num)
+            dec = f"{num:.2f}".split('.')[-1]
+            inteiro_fmt = f"{inte:,}".replace(',', '.')
+            return f"R$ {inteiro_fmt},{dec}"
+        except Exception:
+            return s
+    return s
+
+
+def _normalize_valor_item(v: Any) -> Optional[Dict[str, Any]]:
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        tipo = str(v.get("tipo") or v.get("natureza") or "Valor").strip() or "Valor"
+        descricao = str(v.get("descricao") or v.get("titulo") or v.get("texto") or "").strip()
+        valor_raw = v.get("valor_formatado") or v.get("valor") or v.get("valor_causa") or v.get("custas") or v.get("honorarios") or v.get("honorários")
+        moeda = str(v.get("moeda") or "R$").strip()
+        origem = str(v.get("origem") or "").strip()
+        data = str(v.get("data") or "").strip()
+        if valor_raw is None:
+            for k, vv in v.items():
+                if any(token in str(k).lower() for token in ["valor", "custa", "honor", "multa", "inden", "conden"]):
+                    valor_raw = vv
+                    break
+        if valor_raw is None and not descricao:
+            return None
+        valor_fmt = _format_scalar_money(valor_raw) if valor_raw is not None else ""
+        if not valor_fmt and not descricao:
+            return None
+        return {
+            "tipo": tipo,
+            "descricao": descricao,
+            "valor": valor_fmt,
+            "origem": origem,
+            "data": data,
+            "moeda": moeda,
+        }
+    if isinstance(v, (int, float)):
+        if isinstance(v, int):
+            return None
+        return {"tipo": "Valor", "descricao": "", "valor": _format_scalar_money(v), "origem": "capa", "data": ""}
+    s = str(v).strip()
+    if not _looks_like_money_scalar(s):
+        return None
+    return {"tipo": "Valor", "descricao": "", "valor": _format_scalar_money(s), "origem": "capa", "data": ""}
+
+
 
 @app.get("/ui/api/processo/<path:cnj>/pedidos-multas")
 def ui_api_pedidos_multas(cnj: str):
@@ -4787,9 +5083,9 @@ def ui_api_pedidos_multas(cnj: str):
     refresh = (request.args.get("refresh") or "").strip() in ("1", "true", "yes")
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    def _get_cached():
+    def _get_cached_capa():
         try:
-            with db_conn() as conn:
+            with db_connect() as conn:
                 conn.row_factory = sqlite3.Row
                 cur = conn.cursor()
                 cur.execute("SELECT payload, updated_at FROM capa_cache WHERE cnj=?", (cnj,))
@@ -4804,13 +5100,13 @@ def ui_api_pedidos_multas(cnj: str):
                 payload = json.loads(r["payload"])
                 if ts and (datetime.now(timezone.utc) - ts).total_seconds() <= CAPA_CACHE_TTL_SECONDS:
                     return payload, False
-                return payload, True  # stale
+                return payload, True
         except Exception:
             return None, None
 
-    def _set_cached(payload: dict):
+    def _set_cached_capa(payload: dict):
         try:
-            with db_conn() as conn:
+            with db_connect() as conn:
                 cur = conn.cursor()
                 cur.execute(
                     "INSERT INTO capa_cache(cnj,payload,updated_at) VALUES(?,?,?) "
@@ -4823,7 +5119,7 @@ def ui_api_pedidos_multas(cnj: str):
 
     cached_payload, is_stale = (None, None)
     if not refresh:
-        cached_payload, is_stale = _get_cached()
+        cached_payload, is_stale = _get_cached_capa()
 
     data = None
     used_cache = False
@@ -4836,7 +5132,7 @@ def ui_api_pedidos_multas(cnj: str):
         else:
             try:
                 data = client.obter_capa_processo(cnj)  # type: ignore[attr-defined]
-                _set_cached(data)
+                _set_cached_capa(data)
             except requests.RequestException as e:
                 _set_last_api_error(method="GET", path="/processos/{cnj}", status=None, message=str(e))
                 if cached_payload is not None:
@@ -4848,10 +5144,10 @@ def ui_api_pedidos_multas(cnj: str):
     else:
         try:
             data = client.obter_capa_processo(cnj)  # type: ignore[attr-defined]
-            _set_cached(data)
+            _set_cached_capa(data)
         except requests.RequestException as e:
             _set_last_api_error(method="GET", path="/processos/{cnj}", status=None, message=str(e))
-            cached_payload, _st = _get_cached()
+            cached_payload, _st = _get_cached_capa()
             if cached_payload is not None:
                 data = cached_payload
                 used_cache = True
@@ -4869,122 +5165,96 @@ def ui_api_pedidos_multas(cnj: str):
     for v in multas_vals:
         multas.extend(_normalize_to_list(v))
 
-    def _dedupe(items: List[Any]) -> List[Any]:
-        seen = set()
-        out = []
-        for it in items:
-            try:
-                if isinstance(it, (dict, list)):
-                    h = stable_hash(it)
-                else:
-                    h = stable_hash({"v": str(it)})
-            except Exception:
-                h = str(it)
-            if h in seen:
-                continue
-            seen.add(h)
-            out.append(it)
-        return out
+    # Heurística complementar: examina capa, movimentações locais e documentos já baixados/cacheados.
+    text_sources: List[Tuple[str, str, Optional[str]]] = []
+    for s in _flatten_strings(data):
+        if len(s) >= 12:
+            text_sources.append(("capa", s, None))
 
-    pedidos = _dedupe(pedidos)
-    multas = _dedupe(multas)
-
-    # --- 1. Valor da Causa (da capa_cache) ---
-    _VALOR_CAUSA_KEYS = {"valor_causa", "valor_causa_formatado", "valorcausa", "vl_causa", "valor_da_causa"}
-    valor_causa_vals = _collect_key_anywhere(data, _VALOR_CAUSA_KEYS)
-    valor_causa: Optional[str] = None
-    for vc in valor_causa_vals:
-        if vc is None:
-            continue
-        # Se for dict, extrair valor_formatado ou construir de moeda + valor
-        if isinstance(vc, dict):
-            if vc.get("valor_formatado") and str(vc["valor_formatado"]).strip():
-                s = str(vc["valor_formatado"]).strip()
-            elif vc.get("moeda") and vc.get("valor"):
-                try:
-                    num = float(str(vc["valor"]).replace(".", "").replace(",", "."))
-                    formatted = "{:,.2f}".format(num)
-                    s = str(vc["moeda"]).strip() + " " + formatted.replace(",", "X").replace(".", ",").replace("X", ".")
-                except (ValueError, OverflowError):
-                    s = str(vc.get("valor_formatado") or vc.get("valor") or "").strip()
-            elif vc.get("valor"):
-                s = str(vc["valor"]).strip()
-            else:
-                continue
-        else:
-            s = str(vc).strip()
-
-        if not s:
-            continue
-
-        # Se já contém R$, usa direto; caso contrário, tenta formatar como moeda
-        if "R$" in s:
-            valor_causa = s
-        else:
-            try:
-                num = float(s.replace(".", "").replace(",", "."))
-                # Formata no padrão brasileiro: R$ 1.234,56
-                formatted = "{:,.2f}".format(num)
-                valor_causa = "R$ " + formatted.replace(",", "X").replace(".", ",").replace("X", ".")
-            except (ValueError, OverflowError):
-                valor_causa = s
-        break
-
-    # --- 2. Valores extraídos das Movimentações ---
-    _MOV_TEXT_LIMIT = 300
-    _MOV_VALUE_RE = re.compile(r"R\$\s*[\d.,]+", re.IGNORECASE)
-    _MOV_KW_RE = re.compile(
-        r"\b(multa|condena[çc][aã]o|penhora|indeniza[çc][aã]o|honor[aá]rios|valor)\b",
-        re.IGNORECASE,
-    )
-    valores_movs: List[dict] = []
-    try:
-        with db_conn() as conn_mov:
-            conn_mov.row_factory = sqlite3.Row
-            cur_mov = conn_mov.cursor()
-            cur_mov.execute(
-                "SELECT data, texto FROM eventos_mov WHERE cnj=? ORDER BY data DESC LIMIT 500",
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT data, tipo, texto, raw_json FROM eventos_mov WHERE cnj=? ORDER BY COALESCE(data,'') DESC LIMIT 1000",
                 (cnj,),
             )
-            for row_mov in cur_mov.fetchall():
-                texto = (row_mov["texto"] or "").strip()
-                if not texto:
-                    continue
-                found_vals = _MOV_VALUE_RE.findall(texto)
-                if found_vals:
-                    valores_movs.append({
-                        "data": row_mov["data"] or "",
-                        "descricao": texto[:_MOV_TEXT_LIMIT],
-                        "valor": found_vals[0].strip(),
-                        "keyword": "",
-                    })
-                else:
-                    kw_match = _MOV_KW_RE.search(texto)
-                    if not kw_match:
-                        continue
-                    keyword_found = kw_match.group(0).lower()
-                    valores_movs.append({
-                        "data": row_mov["data"] or "",
-                        "descricao": texto[:_MOV_TEXT_LIMIT],
-                        "valor": "",
-                        "keyword": keyword_found,
-                    })
-    except Exception:
-        pass
-
-    # --- 3. Verificar documentos públicos (docs_v2_cache) ---
-    has_docs_publicos = False
-    try:
-        with db_conn() as conn_docs:
-            conn_docs.row_factory = sqlite3.Row
-            cur_docs = conn_docs.cursor()
-            cur_docs.execute(
-                "SELECT 1 FROM docs_v2_cache WHERE cnj=? AND tipo='publicos' LIMIT 1",
+            for row in cur.fetchall() or []:
+                parts = []
+                if row["tipo"]:
+                    parts.append(str(row["tipo"]))
+                if row["texto"]:
+                    parts.append(str(row["texto"]))
+                merged = " | ".join([p for p in parts if p])
+                if merged:
+                    text_sources.append(("movimentação", merged, row["data"]))
+                if row["raw_json"]:
+                    try:
+                        raw_obj = json.loads(row["raw_json"])
+                        for s in _flatten_strings(raw_obj, limit=120):
+                            if _maybe_contains_money_or_keyword(s):
+                                text_sources.append(("movimentação", s, row["data"]))
+                    except Exception:
+                        raw_s = str(row["raw_json"])
+                        if _maybe_contains_money_or_keyword(raw_s):
+                            text_sources.append(("movimentação", raw_s, row["data"]))
+        except Exception:
+            pass
+        try:
+            cur.execute(
+                "SELECT tipo, titulo, data, meta_json FROM documentos_cache WHERE cnj=? ORDER BY COALESCE(data,'') DESC LIMIT 200",
                 (cnj,),
             )
-            has_docs_publicos = cur_docs.fetchone() is not None
-    except Exception:
-        pass
+            for row in cur.fetchall() or []:
+                parts = []
+                if row["titulo"]:
+                    parts.append(str(row["titulo"]))
+                if row["meta_json"]:
+                    try:
+                        parts.extend(_flatten_strings(json.loads(row["meta_json"]), limit=80))
+                    except Exception:
+                        parts.append(str(row["meta_json"]))
+                merged = " | ".join([p for p in parts if p])
+                if merged:
+                    origem = "documento" if row["tipo"] == "documentos_publicos" else "autos"
+                    text_sources.append((origem, merged, row["data"]))
+        except Exception:
+            pass
+
+    extracted_pedidos: List[Dict[str, Any]] = []
+    extracted_multas: List[Dict[str, Any]] = []
+    extracted_valores: List[Dict[str, Any]] = []
+    for source, txt, dt in text_sources:
+        extracted_pedidos.extend(_extract_matches_from_text(txt, source, "pedido", dt))
+        extracted_multas.extend(_extract_matches_from_text(txt, source, "multa", dt))
+        extracted_valores.extend(_extract_keyword_values(txt, source, dt))
+        extracted_valores.extend(_extract_money_mentions(txt, source, dt))
+
+    pedidos.extend(extracted_pedidos)
+    multas.extend(extracted_multas)
+
+    valores: List[Any] = []
+    for v in _collect_key_anywhere(data, {"valor", "valor_formatado", "valor_causa", "custas", "honorarios", "honorários"}):
+        valores.extend(_normalize_to_list(v))
+    valores.extend(extracted_valores)
+
+    valores_norm: List[Dict[str, Any]] = []
+    for item in valores:
+        norm = _normalize_valor_item(item)
+        if norm:
+            valores_norm.append(norm)
+
+    def _valor_sort_key(x: Dict[str, Any]):
+        origem = (x.get("origem") or "").lower()
+        prioridade = {"movimentação": 0, "documento": 1, "autos": 2, "capa": 3}.get(origem, 9)
+        data = x.get("data") or ""
+        return (prioridade, str(data))
+
+    valores_norm.sort(key=_valor_sort_key)
+
+    pedidos = _dedupe_any(pedidos)
+    multas = _dedupe_any(multas)
+    valores = _dedupe_any(valores_norm)
 
     return jsonify({
         "ok": True,
@@ -4992,152 +5262,9 @@ def ui_api_pedidos_multas(cnj: str):
         "stale": bool(stale_used),
         "pedidos": pedidos,
         "multas": multas,
-        "valor_causa": valor_causa,
-        "valores_movs": valores_movs,
-        "has_docs_publicos": has_docs_publicos,
+        "valores": valores,
+        "fontes": sorted(list({src for src, _, _ in text_sources})),
     })
-
-
-# ============================================================
-# UI API: Documentos / Solicitar atualização / Status / Download
-# ============================================================
-
-@app.get("/ui/api/processo/<path:cnj>/documentos")
-def ui_api_documentos(cnj: str):
-    """Proxy da aba Documentos na UI de processo → cache docs_v2_cache (Escavador v2)."""
-    if not CNJ_REGEX.fullmatch(cnj):
-        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
-
-    tipo = (request.args.get("tipo") or "publicos").strip().lower()
-    if tipo not in ("publicos", "autos"):
-        return jsonify({"ok": False, "error": "TIPO_INVALIDO", "message": "tipo deve ser publicos|autos"}), 400
-
-    limit_n = 50
-    page_n = 1
-
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT items_json, links_json, paginator_json, updated_at FROM docs_v2_cache "
-        "WHERE cnj=? AND tipo=? AND limit_n=? AND page_n=?",
-        (cnj, tipo, limit_n, page_n),
-    )
-    row = cur.fetchone()
-    conn.close()
-
-    if row:
-        items_json, links_json, paginator_json, updated_at = row
-        return jsonify({
-            "ok": True, "cnj": cnj, "tipo": tipo, "source": "cache",
-            "items": json.loads(items_json),
-            "links": json.loads(links_json) if links_json else None,
-            "paginator": json.loads(paginator_json) if paginator_json else None,
-            "updated_at": updated_at,
-        })
-
-    # Sem cache: tenta buscar direto na API do Escavador
-    try:
-        require_token_configured()
-        if tipo == "publicos":
-            data = client.listar_documentos_publicos_v2(cnj, limit=limit_n, page=page_n)
-        else:
-            data = client.listar_autos_v2(cnj, limit=limit_n, page=page_n)
-
-        items = data.get("items") if isinstance(data, dict) else []
-        if not isinstance(items, list):
-            items = []
-        links = data.get("links") if isinstance(data, dict) else None
-        paginator = data.get("paginator") if isinstance(data, dict) else None
-
-        now = utcnow_iso()
-        if items:
-            conn = db_conn()
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT OR REPLACE INTO docs_v2_cache"
-                "(cnj, tipo, limit_n, page_n, items_json, links_json, paginator_json, updated_at)"
-                " VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    cnj, tipo, limit_n, page_n,
-                    json.dumps(items, ensure_ascii=False),
-                    json.dumps(links, ensure_ascii=False) if links is not None else None,
-                    json.dumps(paginator, ensure_ascii=False) if paginator is not None else None,
-                    now,
-                ),
-            )
-            conn.commit()
-            conn.close()
-
-        return jsonify({
-            "ok": True, "cnj": cnj, "tipo": tipo, "source": "api",
-            "items": items, "links": links, "paginator": paginator, "updated_at": now,
-        })
-    except Exception as ex:
-        return jsonify({
-            "ok": True, "cnj": cnj, "tipo": tipo, "source": "empty",
-            "items": [], "warning": str(ex),
-        })
-
-
-@app.post("/ui/api/processo/<path:cnj>/solicitar-atualizacao")
-def ui_api_solicitar_atualizacao(cnj: str):
-    if not CNJ_REGEX.fullmatch(cnj):
-        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
-    payload = request.get_json(force=True, silent=True) or {}
-    tipo = (payload.get("tipo") or "").strip().lower()
-    if tipo not in ("documentos_publicos", "autos"):
-        return jsonify({"ok": False, "error": "TIPO_INVALIDO", "message": "tipo deve ser documentos_publicos|autos"}), 400
-    return api_solicitar_atualizacao_v2(cnj)
-
-
-@app.get("/ui/api/processo/<path:cnj>/status-atualizacao")
-def ui_api_status_atualizacao(cnj: str):
-    if not CNJ_REGEX.fullmatch(cnj):
-        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
-    return api_solicitar_status_v2(cnj)
-
-
-@app.get("/ui/api/processo/<path:cnj>/documentos/<path:key>/download")
-def ui_api_download_documento(cnj: str, key: str):
-    require_token_configured()
-    if not CNJ_REGEX.fullmatch(cnj):
-        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
-    data_doc = (request.args.get("data") or "").strip()[:20]
-    tipo_doc = (request.args.get("tipo") or "").strip()[:40]
-    ext_doc  = (request.args.get("ext")  or "pdf").strip()[:5]
-    try:
-        r = client.baixar_documento_pdf_v2(cnj, key)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 502
-    cnj_safe  = re.sub(r"[^A-Za-z0-9_\-]", "_", cnj)[:40]
-    data_safe = re.sub(r"[^A-Za-z0-9_\-]", "_", data_doc)[:20] if data_doc else "sem_data"
-    tipo_safe = re.sub(r"[^A-Za-z0-9_\-]", "_", tipo_doc.replace(" ", "_"))[:30] if tipo_doc else "documento"
-    _allowed_exts = {"pdf", "doc", "docx", "odt", "rtf", "txt", "xls", "xlsx"}
-    ext_safe  = ext_doc.lower() if ext_doc.lower() in _allowed_exts else "pdf"
-    filename  = f"{cnj_safe}_{data_safe}_{tipo_safe}.{ext_safe}"
-    headers = {
-        "Content-Type": r.headers.get("Content-Type", "application/pdf"),
-        "Content-Disposition": f'attachment; filename="{filename}"',
-    }
-    return Response(r.content, status=200, headers=headers)
-
-
-@app.get("/ui/api/processo/<path:cnj>/documentos/<path:key>/preview")
-def ui_api_preview_documento(cnj: str, key: str):
-    require_token_configured()
-    if not CNJ_REGEX.fullmatch(cnj):
-        return jsonify({"ok": False, "error": "CNJ_INVALIDO", "message": "CNJ inválido."}), 400
-    try:
-        r = client.baixar_documento_pdf_v2(cnj, key)
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 502
-    safe_key = re.sub(r"[^A-Za-z0-9_\-]", "_", key)[:64]
-    filename = f"documento_{safe_key}.pdf"
-    headers = {
-        "Content-Type": r.headers.get("Content-Type", "application/pdf"),
-        "Content-Disposition": f'inline; filename="{filename}"',
-    }
-    return Response(r.content, status=200, headers=headers)
 
 
 @app.get("/ui/admin")
@@ -5146,6 +5273,8 @@ def ui_admin():
     <div class="card p-3">
       <div class="h5 mb-1">Admin</div>
       <div class="muted">Ajustes operacionais do monitor (auto-discover, saúde, diagnósticos).</div>
+
+      <div class="mt-3"><a class="btn btn-outline-primary btn-sm" href="/ui/admin/monitoramentos">Abrir Monitoramentos</a></div>
 
       <hr class="divider">
 
@@ -5323,7 +5452,7 @@ def ui_admin():
               <div class="d-flex justify-content-between align-items-start">
                 <div>
                   <div><b>${esc(doc)}</b> <span class="muted">(${esc(it.tipo_doc)})</span></div>
-                  <div class="muted small">Criado em: ${esc(fmtDt(it.created_at))}</div>
+                  <div class="muted small">Criado em: ${esc(it.created_at || "")}</div>
                 </div>
                 <div class="d-flex gap-2">
                   <button class="btn btn-sm btn-outline-primary" onclick="discover('${esc(doc)}')">Descobrir</button>
@@ -6301,6 +6430,512 @@ def ui_api_alerts_export_csv():
     return Response(out, mimetype="text/csv; charset=utf-8")
 
 
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,))
+    return cur.fetchone() is not None
+
+
+def _list_local_monitoramentos() -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                p.cnj,
+                p.created_at,
+                p.last_sync_at,
+                p.last_event_at,
+                COUNT(DISTINCT dp.doc) AS links_count,
+                GROUP_CONCAT(DISTINCT dp.doc) AS docs_csv,
+                COUNT(DISTINCT ev.id) AS eventos_count
+            FROM processos p
+            LEFT JOIN doc_process dp ON dp.cnj = p.cnj
+            LEFT JOIN eventos_mov ev ON ev.cnj = p.cnj
+            GROUP BY p.cnj, p.created_at, p.last_sync_at, p.last_event_at
+            ORDER BY COALESCE(p.last_event_at, p.last_sync_at, p.created_at) DESC, p.cnj ASC
+        """)
+        rows = []
+        for r in cur.fetchall():
+            item = dict(r)
+            docs = [d for d in (item.get("docs_csv") or "").split(",") if d]
+            item["docs"] = docs
+            item["is_orfao_local"] = len(docs) == 0
+            rows.append(item)
+        return rows
+
+
+def _list_watchlist_local() -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                w.id, w.doc, w.tipo_doc, w.created_at,
+                COUNT(DISTINCT dp.cnj) AS processos_count
+            FROM watchlist w
+            LEFT JOIN doc_process dp ON dp.doc = w.doc
+            GROUP BY w.id, w.doc, w.tipo_doc, w.created_at
+            ORDER BY w.id DESC
+        """)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def _cleanup_local_processo(cnj: str) -> dict:
+    cnj = (cnj or "").strip()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM eventos_mov WHERE cnj=?", (cnj,))
+        eventos = cur.rowcount or 0
+        cur.execute("DELETE FROM documentos_cache WHERE cnj=?", (cnj,))
+        docs_cache = cur.rowcount or 0
+        cur.execute("DELETE FROM processo_updates WHERE cnj=?", (cnj,))
+        updates = cur.rowcount or 0
+        cur.execute("DELETE FROM doc_process WHERE cnj=?", (cnj,))
+        links = cur.rowcount or 0
+        cur.execute("DELETE FROM processos WHERE cnj=?", (cnj,))
+        processos = cur.rowcount or 0
+        conn.commit()
+    return {"cnj": cnj, "deleted_processos": processos, "deleted_links": links, "deleted_eventos": eventos, "deleted_docs_cache": docs_cache, "deleted_updates": updates}
+
+
+def _cleanup_local_doc(doc: str) -> dict:
+    doc = normalize_doc(doc)
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT cnj FROM doc_process WHERE doc=?", (doc,))
+        cnjs = [r[0] for r in cur.fetchall()]
+        cur.execute("DELETE FROM doc_process WHERE doc=?", (doc,))
+        links = cur.rowcount or 0
+        cur.execute("DELETE FROM watchlist WHERE doc=?", (doc,))
+        watch = cur.rowcount or 0
+        deleted_orfaos = 0
+        for cnj in cnjs:
+            cur.execute("SELECT 1 FROM doc_process WHERE cnj=? LIMIT 1", (cnj,))
+            if cur.fetchone() is None:
+                cur.execute("DELETE FROM eventos_mov WHERE cnj=?", (cnj,))
+                cur.execute("DELETE FROM documentos_cache WHERE cnj=?", (cnj,))
+                cur.execute("DELETE FROM processo_updates WHERE cnj=?", (cnj,))
+                cur.execute("DELETE FROM processos WHERE cnj=?", (cnj,))
+                deleted_orfaos += cur.rowcount or 0
+        conn.commit()
+    return {"doc": doc, "deleted_watchlist": watch, "deleted_links": links, "deleted_orphan_processes": deleted_orfaos}
+
+
+def _cleanup_local_orfaos() -> dict:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT p.cnj FROM processos p LEFT JOIN doc_process dp ON dp.cnj = p.cnj WHERE dp.cnj IS NULL")
+        cnjs = [r[0] for r in cur.fetchall()]
+        total = 0
+        for cnj in cnjs:
+            cur.execute("DELETE FROM eventos_mov WHERE cnj=?", (cnj,))
+            cur.execute("DELETE FROM documentos_cache WHERE cnj=?", (cnj,))
+            cur.execute("DELETE FROM processo_updates WHERE cnj=?", (cnj,))
+            cur.execute("DELETE FROM processos WHERE cnj=?", (cnj,))
+            total += cur.rowcount or 0
+        conn.commit()
+    return {"deleted_orphan_processes": total, "cnjs": cnjs}
+
+
+def _extract_remote_monitor_rows(payload: Any) -> list[dict]:
+    rows = extract_list(payload)
+    if not rows and isinstance(payload, dict):
+        for key in ("monitoramentos", "data", "items", "results"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                rows = val
+                break
+    out = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        monitor_id = item.get("id")
+        cnj = (item.get("numero") or item.get("numero_cnj") or item.get("cnj") or "").strip()
+        out.append({"id": monitor_id, "cnj": cnj, "raw": item})
+    return out
+
+
+@app.get("/admin/monitoramentos/local")
+def admin_monitoramentos_local_json():
+    return jsonify({"ok": True, "items": _list_local_monitoramentos(), "watchlist": _list_watchlist_local()})
+
+
+@app.post("/admin/monitoramentos/local/processo/cleanup")
+def admin_monitoramentos_local_cleanup_processo():
+    payload = request.get_json(force=True, silent=True) or {}
+    cnj = (payload.get("cnj") or request.form.get("cnj") or "").strip()
+    if not cnj:
+        return jsonify({"ok": False, "error": "CNJ é obrigatório."}), 400
+    return jsonify({"ok": True, **_cleanup_local_processo(cnj)})
+
+
+@app.post("/admin/monitoramentos/local/doc/cleanup")
+def admin_monitoramentos_local_cleanup_doc():
+    payload = request.get_json(force=True, silent=True) or {}
+    doc = (payload.get("doc") or request.form.get("doc") or "").strip()
+    if not doc:
+        return jsonify({"ok": False, "error": "Doc é obrigatório."}), 400
+    return jsonify({"ok": True, **_cleanup_local_doc(doc)})
+
+
+@app.post("/admin/monitoramentos/local/orfaos/cleanup")
+def admin_monitoramentos_local_cleanup_orfaos():
+    return jsonify({"ok": True, **_cleanup_local_orfaos()})
+
+
+@app.get("/admin/monitoramentos/remote")
+def admin_monitoramentos_remote_list():
+    require_token_configured()
+    try:
+        payload = client.listar_monitoramentos_processos(limit=100, page=1)  # type: ignore
+        return jsonify({"ok": True, "items": _extract_remote_monitor_rows(payload), "raw": payload})
+    except EscavadorUnauthorized as e:
+        return jsonify({"ok": False, "error": f"Token sem autorização para listar monitoramentos: {e}"}), 403
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/admin/monitoramentos/remote/remove")
+def admin_monitoramentos_remote_remove():
+    require_token_configured()
+    payload = request.get_json(force=True, silent=True) or {}
+    mid = payload.get("id") or request.form.get("id")
+    if mid in (None, ""):
+        return jsonify({"ok": False, "error": "ID do monitoramento é obrigatório."}), 400
+    try:
+        client.remover_monitoramento_processo(int(mid))  # type: ignore
+        return jsonify({"ok": True, "removed_id": int(mid)})
+    except EscavadorUnauthorized as e:
+        return jsonify({"ok": False, "error": f"Token sem autorização para remover monitoramentos: {e}"}), 403
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/admin/monitoramentos/local/monitorar-cnj")
+def admin_monitoramentos_local_monitorar_cnj():
+    require_token_configured()
+    payload = request.get_json(force=True, silent=False) or {}
+    cnj_in = (payload.get("cnj") or "").strip()
+    if not cnj_in:
+        return jsonify({"ok": False, "error": "CNJ é obrigatório."}), 400
+    try:
+        cnj = normalize_cnj(cnj_in)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+    escavador_status = "created"
+    escavador_detail = None
+    try:
+        client.criar_monitor_processo(cnj)  # type: ignore
+    except EscavadorAlreadyMonitored as e:
+        escavador_status = "already_monitored"
+        escavador_detail = str(e)
+    except EscavadorUnauthorized as e:
+        return jsonify({"ok": False, "error": f"Token sem autorização para monitorar o CNJ: {e}"}), 403
+    except requests.HTTPError as e:
+        resp = getattr(e, "response", None)
+        detail = None
+        try:
+            detail = resp.text if resp is not None else str(e)
+        except Exception:
+            detail = str(e)
+        return jsonify({"ok": False, "error": "Falha ao criar monitoramento no Escavador.", "detail": detail}), 502
+
+    with sqlite3.connect(DB_PATH) as conn:
+        upsert_processo(conn, cnj)
+        cur = conn.cursor()
+        cur.execute("UPDATE processos SET last_sync_at=COALESCE(last_sync_at, ? ) WHERE cnj=?", (utcnow_iso(), cnj))
+        conn.commit()
+
+    synced_events = None
+    sync_error = None
+    try:
+        st = sync_process_movements(client, cnj, limit=100)  # type: ignore
+        synced_events = st.new_events
+    except Exception as e:
+        sync_error = str(e)
+        logger.warning("Monitorar CNJ %s: não foi possível sincronizar movimentações iniciais: %s", cnj, sync_error)
+
+    return jsonify({
+        "ok": True,
+        "cnj": cnj,
+        "escavador_status": escavador_status,
+        "escavador_detail": escavador_detail,
+        "synced_events": synced_events,
+        "sync_error": sync_error,
+    })
+
+
+@app.get("/ui/admin/monitoramentos")
+def ui_admin_monitoramentos():
+    local_items = _list_local_monitoramentos()
+    watch_items = _list_watchlist_local()
+
+    local_rows = ""
+    for item in local_items:
+        badge = "<span class='badge text-bg-warning'>Órfão local</span>" if item.get("is_orfao_local") else "<span class='badge text-bg-success'>Vinculado</span>"
+        docs = ", ".join(item.get("docs") or []) or "—"
+        search_text = esc((((item.get("cnj") or "") + " " + docs).lower()))
+        detail_href = f"/ui/processo/{quote(str(item.get('cnj') or ''))}"
+        timeline_href = f"/processos/{quote(str(item.get('cnj') or ''))}/movimentacoes?limit=25&offset=0"
+        docs_href = f"/processos/{quote(str(item.get('cnj') or ''))}/docs"
+        local_rows += f"""
+        <tr data-search='{search_text}'>
+          <td class='mono small'><a href='{detail_href}'>{esc(item.get('cnj'))}</a></td>
+          <td>{badge}</td>
+          <td class='small'>{esc(docs)}</td>
+          <td class='text-end mono small'>{int(item.get('links_count') or 0)}</td>
+          <td class='text-end mono small'>{int(item.get('eventos_count') or 0)}</td>
+          <td class='mono small'>{esc((item.get('last_sync_at') or item.get('created_at') or '')[:19]).replace('T',' ')}</td>
+          <td class='text-end'>
+            <div class='btn-group btn-group-sm'>
+              <a class='btn btn-outline-primary' href='{detail_href}'>Ver detalhes</a>
+              <a class='btn btn-outline-secondary' href='{timeline_href}' target='_blank'>JSON movs</a>
+              <a class='btn btn-outline-secondary' href='{docs_href}' target='_blank'>JSON docs</a>
+              <button class='btn btn-outline-danger' onclick="cleanupProcess('{esc(item.get('cnj'))}')">Limpar local</button>
+            </div>
+          </td>
+        </tr>
+        """
+    if not local_rows:
+        local_rows = "<tr><td colspan='7' class='muted'>Nenhum processo local encontrado.</td></tr>"
+
+    watch_rows = ""
+    for item in watch_items:
+        watch_rows += f"""
+        <tr>
+          <td class='mono small'>{esc(item.get('doc'))}</td>
+          <td>{esc(item.get('tipo_doc') or '')}</td>
+          <td class='text-end mono small'>{int(item.get('processos_count') or 0)}</td>
+          <td class='mono small'>{esc((item.get('created_at') or '')[:19]).replace('T',' ')}</td>
+          <td class='text-end'><button class='btn btn-sm btn-outline-danger' onclick="cleanupDoc('{esc(item.get('doc'))}')">Limpar local</button></td>
+        </tr>
+        """
+    if not watch_rows:
+        watch_rows = "<tr><td colspan='5' class='muted'>Watchlist vazia.</td></tr>"
+
+    body = f"""
+    <div class='d-flex align-items-center justify-content-between mb-3'>
+      <div>
+        <div class='h4 mb-0'>Admin / Monitoramentos</div>
+        <div class='muted small'>Raio-X dos monitoramentos locais, limpeza profunda e ponte pronta para remover no Escavador.</div>
+      </div>
+      <div class='d-flex gap-2 flex-wrap'>
+        <a class='btn btn-outline-secondary' href='/ui'>Dashboard</a>
+        <a class='btn btn-outline-secondary' href='/ui/watchlist'>Watch-List</a>
+        <a class='btn btn-outline-secondary' href='/ui/admin'>Admin</a>
+        <button class='btn btn-outline-danger' onclick='cleanupOrphans()'>Limpar órfãos locais</button>
+        <button class='btn btn-outline-primary' onclick='loadRemote()'>Carregar remoto</button>
+      </div>
+    </div>
+
+    <div id='adminMsg' class='mb-3'></div>
+
+    <div class='card p-3 mb-3'>
+      <div class='h6 mb-2'>Consulta rápida</div>
+      <div class='muted small mb-3'>Atalhos para abrir a navegação do Specter sem decorar URL. Digite um CNJ e siga para a página do processo.</div>
+      <div class='row g-3 align-items-end'>
+        <div class='col-lg-6'>
+          <label class='form-label small muted'>Abrir processo por CNJ</label>
+          <input id='quickCnjInput' class='form-control mono' placeholder='1018484-34.2015.8.26.0224'>
+        </div>
+        <div class='col-lg-6'>
+          <div class='d-flex gap-2 flex-wrap'>
+            <button class='btn btn-primary' onclick='openQuickProcess()'>Ver detalhes</button>
+            <button class='btn btn-outline-secondary' onclick='openQuickMovs()'>Movimentações JSON</button>
+            <button class='btn btn-outline-secondary' onclick='openQuickDocs()'>Docs JSON</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class='card p-3 mb-3'>
+      <div class='row g-3 align-items-end'>
+        <div class='col-lg-5'>
+          <div class='h6 mb-2'>Monitorar CNJ diretamente</div>
+          <div class='muted small mb-2'>Cria o monitoramento no Escavador sem passar pela watchlist e grava o CNJ localmente.</div>
+          <label class='form-label small muted'>CNJ</label>
+          <input id='cnjDirectInput' class='form-control mono' placeholder='1018484-34.2015.8.26.0224'>
+        </div>
+        <div class='col-lg-2'>
+          <button class='btn btn-primary w-100' onclick='monitorDirectCnj()'>Monitorar CNJ</button>
+        </div>
+        <div class='col-lg-5'>
+          <div class='h6 mb-2'>Filtrar processos locais</div>
+          <div class='muted small mb-2'>Filtro apenas visual na grade local.</div>
+          <input id='localFilterInput' class='form-control' placeholder='Digite CNJ ou documento vinculado'>
+        </div>
+      </div>
+    </div>
+
+    <div class='card p-3 mb-3'>
+      <div class='h6 mb-2'>Processos locais</div>
+      <div class='table-responsive'>
+        <table class='table table-sm align-middle'>
+          <thead><tr class='muted small'><th>CNJ</th><th>Status</th><th>Docs vinculados</th><th class='text-end'>Links</th><th class='text-end'>Eventos</th><th>Última atividade</th><th class='text-end'>Ações</th></tr></thead>
+          <tbody id='localRows'>{local_rows}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class='card p-3 mb-3'>
+      <div class='h6 mb-2'>Watchlist local</div>
+      <div class='table-responsive'>
+        <table class='table table-sm align-middle'>
+          <thead><tr class='muted small'><th>Doc</th><th>Tipo</th><th class='text-end'>Processos</th><th>Criado em</th><th class='text-end'>Ações</th></tr></thead>
+          <tbody>{watch_rows}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class='card p-3'>
+      <div class='d-flex align-items-center justify-content-between mb-2'>
+        <div class='h6 mb-0'>Monitoramentos remotos no Escavador</div>
+        <div class='muted small'>Usa <code>GET /monitoramentos/processos</code> e <code>DELETE /monitoramentos/processos/{{id}}</code>.</div>
+      </div>
+      <div class='table-responsive'>
+        <table class='table table-sm align-middle'>
+          <thead><tr class='muted small'><th>ID remoto</th><th>CNJ</th><th class='text-end'>Ações</th></tr></thead>
+          <tbody id='remoteRows'><tr><td colspan='3' class='muted'>Clique em <b>Carregar remoto</b> para consultar o Escavador.</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <script>
+    function msg(kind, html){{
+      const el = document.getElementById('adminMsg');
+      const cls = kind==='ok' ? 'alert alert-success' : (kind==='warn' ? 'alert alert-warning' : 'alert alert-danger');
+      el.innerHTML = `<div class="${{cls}}">${{html}}</div>`;
+    }}
+
+    async function postJson(url, payload){{
+      const r = await fetch(url, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(payload||{{}})}});
+      const j = await r.json();
+      if(!r.ok || !j.ok) throw new Error(j.error || `Falha em ${{url}}`);
+      return j;
+    }}
+
+    async function cleanupProcess(cnj){{
+      if(!confirm(`Limpar localmente o processo ${{cnj}}? Isso remove vínculos, eventos e caches locais.`)) return;
+      try {{
+        const j = await postJson('/admin/monitoramentos/local/processo/cleanup', {{cnj}});
+        msg('ok', `Processo <b>${{cnj}}</b> limpo localmente.`);
+        setTimeout(()=>location.reload(), 300);
+      }} catch(ex) {{ msg('err', ex.message); }}
+    }}
+
+    async function cleanupDoc(doc){{
+      if(!confirm(`Limpar localmente o doc ${{doc}}? Isso remove watchlist, vínculos e órfãos gerados.`)) return;
+      try {{
+        const j = await postJson('/admin/monitoramentos/local/doc/cleanup', {{doc}});
+        msg('ok', `Documento <b>${{doc}}</b> limpo localmente.`);
+        setTimeout(()=>location.reload(), 300);
+      }} catch(ex) {{ msg('err', ex.message); }}
+    }}
+
+    async function cleanupOrphans(){{
+      if(!confirm('Remover todos os processos órfãos locais?')) return;
+      try {{
+        const j = await postJson('/admin/monitoramentos/local/orfaos/cleanup', {{}});
+        msg('ok', `Órfãos removidos: <b>${{j.deleted_orphan_processes || 0}}</b>.`);
+        setTimeout(()=>location.reload(), 300);
+      }} catch(ex) {{ msg('err', ex.message); }}
+    }}
+
+    async function loadRemote(){{
+      const tbody = document.getElementById('remoteRows');
+      tbody.innerHTML = `<tr><td colspan='3' class='muted'>Consultando Escavador...</td></tr>`;
+      try {{
+        const r = await fetch('/admin/monitoramentos/remote');
+        const j = await r.json();
+        if(!r.ok || !j.ok) throw new Error(j.error || 'Falha ao consultar remoto');
+        const items = j.items || [];
+        if(!items.length) {{
+          tbody.innerHTML = `<tr><td colspan='3' class='muted'>Nenhum monitoramento remoto retornado.</td></tr>`;
+          return;
+        }}
+        tbody.innerHTML = items.map(it => `
+          <tr>
+            <td class='mono small'>${{it.id ?? ''}}</td>
+            <td class='mono small'>${{it.cnj || '—'}}</td>
+            <td class='text-end'><button class='btn btn-sm btn-outline-danger' onclick='removeRemote(${{it.id}}, "${{(it.cnj||'').replace(/"/g,'&quot;')}}")'>Remover no Escavador</button></td>
+          </tr>`).join('');
+      }} catch(ex) {{
+        tbody.innerHTML = `<tr><td colspan='3' class='text-danger'>${{ex.message}}</td></tr>`;
+      }}
+    }}
+
+    async function removeRemote(id, cnj){{
+      if(!confirm(`Remover o monitoramento remoto ID ${{id}}${{cnj ? ' do CNJ ' + cnj : ''}}?`)) return;
+      try {{
+        await postJson('/admin/monitoramentos/remote/remove', {{id}});
+        msg('ok', `Monitoramento remoto <b>${{id}}</b> removido.`);
+        loadRemote();
+      }} catch(ex) {{ msg('err', ex.message); }}
+    }}
+
+    function getQuickCnj(){{
+      const v = (document.getElementById('quickCnjInput')?.value || document.getElementById('cnjDirectInput')?.value || '').trim();
+      if(!v){{ msg('warn', 'Informe um CNJ para consultar.'); return ''; }}
+      return v;
+    }}
+
+    function openQuickProcess(){{
+      const cnj = getQuickCnj();
+      if(!cnj) return;
+      window.location.href = '/ui/processo/' + encodeURIComponent(cnj);
+    }}
+
+    function openQuickMovs(){{
+      const cnj = getQuickCnj();
+      if(!cnj) return;
+      window.open('/processos/' + encodeURIComponent(cnj) + '/movimentacoes?limit=25&offset=0', '_blank');
+    }}
+
+    function openQuickDocs(){{
+      const cnj = getQuickCnj();
+      if(!cnj) return;
+      window.open('/processos/' + encodeURIComponent(cnj) + '/docs', '_blank');
+    }}
+
+    async function monitorDirectCnj(){{
+      const el = document.getElementById('cnjDirectInput');
+      const cnj = (el.value || '').trim();
+      if(!cnj){{ msg('warn', 'Informe um CNJ para monitorar.'); return; }}
+      try {{
+        const j = await postJson('/admin/monitoramentos/local/monitorar-cnj', {{cnj}});
+        let extra = '';
+        if(j.escavador_status === 'already_monitored') extra += ' O Escavador informou que ele já estava sendo monitorado.';
+        if(j.synced_events !== null && j.synced_events !== undefined) extra += ` Movimentações novas sincronizadas: <b>${{j.synced_events}}</b>.`;
+        if(j.sync_error) extra += ` <span class='text-warning'>Sincronização inicial parcial: ${{j.sync_error}}</span>`;
+        extra += ` <a href="/ui/processo/${{encodeURIComponent(j.cnj)}}" class="alert-link">Abrir detalhes do processo</a>.`;
+        msg('ok', `CNJ <b>${{j.cnj}}</b> registrado no Specter.${{extra}}`);
+        const quick = document.getElementById('quickCnjInput');
+        if(quick) quick.value = j.cnj || '';
+        el.value = '';
+        setTimeout(()=>location.reload(), 900);
+      }} catch(ex) {{ msg('err', ex.message); }}
+    }}
+
+    function applyLocalFilter(){{
+      const q = (document.getElementById('localFilterInput').value || '').trim().toLowerCase();
+      const rows = Array.from(document.querySelectorAll('#localRows tr'));
+      let visible = 0;
+      rows.forEach(tr => {{
+        const hay = (tr.getAttribute('data-search') || tr.innerText || '').toLowerCase();
+        const show = !q || hay.includes(q);
+        tr.style.display = show ? '' : 'none';
+        if(show) visible++;
+      }});
+    }}
+
+    document.getElementById('localFilterInput')?.addEventListener('input', applyLocalFilter);
+    </script>
+    """
+    return render_template_string(UI_BASE, body=body)
+
+
 @app.get("/ui/dashboard")
 def ui_dashboard():
     return redirect("/ui#dashboard")
@@ -6448,158 +7083,6 @@ def ui_costs():
     """
     return render_template_string(UI_BASE, body=body)
 
-
-@app.get("/ui/documentacao")
-def ui_documentacao():
-    md_path = pathlib.Path(__file__).parent / "DEPARA.md"
-    try:
-        md_text = md_path.read_text(encoding="utf-8")
-    except (FileNotFoundError, PermissionError, UnicodeDecodeError) as exc:
-        md_text = f"# Erro ao carregar DEPARA.md\n\nArquivo esperado em `{md_path}`. Detalhe: {exc}"
-
-    content_html = _md_to_html(md_text)
-
-    body = f"""
-    <div class="mb-3 d-flex align-items-center justify-content-between flex-wrap gap-2">
-      <div>
-        <div class="muted small">Referência técnica</div>
-        <div class="h4 mb-0">Documentação do Monitor Jurídico</div>
-        <div class="muted small mt-1">Endpoints Escavador v2, métodos Python e precificação utilizados nesta aplicação.</div>
-      </div>
-      <button class="btn btn-outline-light btn-sm" onclick="baixarHTML()">⬇️ Baixar como HTML</button>
-    </div>
-    <div id="doc-content">
-      <div class="card p-4 mb-4">
-        <div class="h6 mb-3">📋 Endpoints e Precificação da API Escavador v2</div>
-        <div class="table-responsive">
-          <table class="table table-dark table-hover align-middle">
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Funcionalidade</th>
-                <th>Endpoint Escavador v2</th>
-                <th>Método Python</th>
-                <th>Custo estimado</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>1</td>
-                <td><strong>Busca do CNPJ</strong> (Watchlist / Monitoramento)</td>
-                <td><code>POST /api/v2/monitoramentos/novos-processos</code></td>
-                <td>— (webhook recebido)</td>
-                <td>— (sem custo de chamada ativa)</td>
-              </tr>
-              <tr>
-                <td>2</td>
-                <td><strong>Busca de Processos por CNPJ</strong> (Discover)</td>
-                <td><code>GET /api/v2/envolvido/processos?cpf_cnpj=...</code></td>
-                <td><code>listar_processos_envolvido()</code></td>
-                <td>R$ 2,90 até 200 itens + R$ 0,05/200 adicionais</td>
-              </tr>
-              <tr>
-                <td>3</td>
-                <td><strong>Resumo</strong> (sidebar do processo)</td>
-                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}</code></td>
-                <td><code>obter_capa_processo()</code></td>
-                <td>R$ 0,04 (cache 1 dia)</td>
-              </tr>
-              <tr>
-                <td>4</td>
-                <td><strong>Capa</strong> do processo</td>
-                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}</code></td>
-                <td><code>obter_capa_processo()</code></td>
-                <td>R$ 0,04 (cache 1 dia)</td>
-              </tr>
-              <tr>
-                <td>5</td>
-                <td><strong>Partes</strong> (polo ativo/passivo)</td>
-                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}</code> — campo <code>envolvidos[]</code></td>
-                <td><code>obter_capa_processo()</code></td>
-                <td>— (mesmo JSON da Capa)</td>
-              </tr>
-              <tr>
-                <td>6</td>
-                <td><strong>Pedidos &amp; Multas</strong></td>
-                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}</code> — campos <code>pedidos</code> e <code>multas</code></td>
-                <td><code>obter_capa_processo()</code></td>
-                <td>— (mesmo JSON da Capa)</td>
-              </tr>
-              <tr>
-                <td>7</td>
-                <td><strong>Movimentações</strong></td>
-                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}/movimentacoes</code></td>
-                <td><code>listar_movimentacoes()</code></td>
-                <td>R$ 0,04 por chamada</td>
-              </tr>
-              <tr>
-                <td>8</td>
-                <td><strong>Documentações</strong> (docs públicos)</td>
-                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}/documentos-publicos</code></td>
-                <td><code>listar_documentos_publicos_v2()</code></td>
-                <td>R$ 0,04 + assíncrono (requer solicitar-atualizacao)</td>
-              </tr>
-              <tr>
-                <td>9</td>
-                <td><strong>Documentações</strong> (autos restritos)</td>
-                <td><code>GET /api/v2/processos/numero_cnj/{{cnj}}/autos</code></td>
-                <td><code>listar_autos_v2()</code></td>
-                <td>R$ 0,04 + certificado A1/A3</td>
-              </tr>
-              <tr>
-                <td>10</td>
-                <td><strong>Monitoramento</strong> (callbacks/webhook)</td>
-                <td>webhook <code>POST</code> recebido de <code>/api/v2/monitoramentos/novos-processos</code></td>
-                <td>rota <code>/webhook</code></td>
-                <td>— (sem custo de chamada ativa)</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="card p-4">
-        <div class="h6 mb-3">🔁 De/Para — Blue Service BPM ↔ Escavador v2</div>
-        <div class="md-body">
-          {content_html}
-        </div>
-      </div>
-    </div>
-
-    <script>
-    function baixarHTML() {{
-      const inner = document.getElementById("doc-content").innerHTML;
-      const html = `<!DOCTYPE html>
-<html lang="pt-BR">
-<head>
-  <meta charset="UTF-8">
-  <title>Documentação do Monitor Jurídico</title>
-  <style>
-    body {{ background:#0b1220; color:#e6e6e6; font-family:sans-serif; padding:2rem; }}
-    table {{ width:100%; border-collapse:collapse; margin-bottom:1rem; font-size:.93rem; }}
-    th, td {{ border:1px solid #2a3550; padding:.45rem .7rem; text-align:left; }}
-    th {{ background:rgba(48,80,160,.2); font-weight:600; }}
-    tr:nth-child(even) td {{ background:rgba(255,255,255,.03); }}
-    code {{ background:rgba(48,80,160,.2); border-radius:5px; padding:.15rem .4rem; font-size:.9em; }}
-    pre {{ background:#0d1525; border:1px solid #2a3550; border-radius:10px; padding:1rem; overflow-x:auto; }}
-    h1,h2,h3 {{ color:#5b8cff; margin-top:1.4rem; margin-bottom:.5rem; }}
-    blockquote {{ border-left:3px solid #5b8cff; padding-left:1rem; color:#999; margin:.8rem 0; }}
-    hr {{ border-color:#2a3550; margin:1.5rem 0; }}
-  </style>
-</head>
-<body>
-${{inner}}
-</body>
-</html>`;
-      const blob = new Blob([html], {{type: "text/html"}});
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = "documentacao_monitor_juridico.html";
-      a.click();
-    }}
-    </script>
-    """
-    return render_template_string(UI_BASE, body=body)
 
 if __name__ == "__main__":
     start_background_tasks()

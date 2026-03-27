@@ -12,7 +12,7 @@ import threading
 import sqlite3
 import time
 import openpyxl
-from urllib.parse import urlparse, parse_qs, unquote_plus
+from urllib.parse import urlparse, parse_qs, unquote_plus, quote
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Tuple
@@ -77,7 +77,7 @@ ESCAVADOR_BASE = os.getenv("ESCAVADOR_BASE", "https://api.escavador.com/api/v2")
 ESCAVADOR_TOKEN = os.getenv("ESCAVADOR_TOKEN", "").strip()
 WEBHOOK_AUTH_TOKEN = os.getenv("WEBHOOK_AUTH_TOKEN", "").strip()
 
-DB_PATH = os.getenv("DB_PATH", "./escavador_monitor.db")
+DB_PATH = os.getenv("DB_PATH", "./specter.db")
 DB_PATH_ABS = os.path.abspath(DB_PATH)
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
 AUTO_DISCOVER_ENABLED = os.getenv("AUTO_DISCOVER_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -260,12 +260,38 @@ def doc_type(doc: str) -> str:
     return "CNPJ" if len(digits) == 14 else "CPF"
 
 
+def normalize_cnj(value: str) -> str:
+    cnj = (value or "").strip()
+    digits = re.sub(r"\D", "", cnj)
+    if len(digits) != 20:
+        raise ValueError("CNJ inválido. Informe no padrão 0000000-00.0000.0.00.0000.")
+    if not re.match(r"^\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}$", cnj):
+        cnj = f"{digits[:7]}-{digits[7:9]}.{digits[9:13]}.{digits[13]}.{digits[14:16]}.{digits[16:20]}"
+    return cnj
+
+
 CNJ_REGEX = re.compile(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}")
 DOC_REGEX = re.compile(r"\b(\d{3}\.?\d{3}\.?\d{3}-?\d{2}|\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})\b")
 
 # ----------------------------
 # Escavador Client
 # ----------------------------
+class EscavadorAlreadyMonitored(Exception):
+    """Raised when Escavador reports the process is already being monitored."""
+
+
+class EscavadorUnauthorized(Exception):
+    """Raised when the token is not authorized for the requested endpoint."""
+
+
+class EscavadorUpdateAlreadyRunning(Exception):
+    """Raised when Escavador reports an update is already running for the process."""
+
+    def __init__(self, payload: Optional[Dict[str, Any]] = None, message: str = "Atualização já em andamento."):
+        super().__init__(message)
+        self.payload = payload or {}
+
+
 class EscavadorClient:
     def __init__(self, base: str, token: str):
         self.base = base.rstrip("/")
@@ -276,7 +302,7 @@ class EscavadorClient:
                 "X-Requested-With": "XMLHttpRequest",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "BlueService-EscavadorMonitor/4.3",
+                "User-Agent": "Specter/4.3",
             }
         )
 
@@ -315,6 +341,31 @@ class EscavadorClient:
                     if attempt < retries:
                         time.sleep(backoff_seconds * attempt)
                         continue
+
+                if r.status_code == 401:
+                    msg = (r.text or "").strip()[:600]
+                    logger.warning("Escavador %s %s unauthorized: %s", method, path, msg)
+                    _set_last_api_error(method, path, r.status_code, r.text)
+                    raise EscavadorUnauthorized(msg or f"401 Unauthorized em {path}")
+
+                if r.status_code == 422 and method.upper() == "POST" and path == "/monitoramentos/processos":
+                    body_txt = (r.text or "").lower()
+                    if "já monitora este processo" in body_txt or "ja monitora este processo" in body_txt:
+                        logger.info("Escavador %s %s: processo já monitorado, sem retry.", method, path)
+                        _set_last_api_error(method, path, r.status_code, r.text)
+                        raise EscavadorAlreadyMonitored((r.text or "").strip())
+
+                if r.status_code == 422 and method.upper() == "POST" and path.endswith("/solicitar-atualizacao"):
+                    body_json = {}
+                    try:
+                        body_json = r.json() if (r.text or "").strip() else {}
+                    except Exception:
+                        body_json = {}
+                    body_txt = ((body_json.get("message") or r.text or "")).lower()
+                    if "já está sendo atualizado" in body_txt or "ja está sendo atualizado" in body_txt or "ja esta sendo atualizado" in body_txt:
+                        logger.info("Escavador %s %s: atualização já em andamento, sem retry.", method, path)
+                        _set_last_api_error(method, path, r.status_code, r.text)
+                        raise EscavadorUpdateAlreadyRunning(body_json, (body_json.get("message") or "Atualização já em andamento."))
 
                 if r.status_code >= 400:
                     logger.error("Escavador %s %s failed %s: %s", method, path, r.status_code, r.text[:1200])
@@ -442,7 +493,7 @@ class EscavadorClient:
             raise
         finally:
             cost = _estimate_cost_brl(service_key, items_upto=0)
-            record_api_usage(doc=None, cnj=numero_cnj, service_key=service_key, http_status=status, items_count=0, cost_brl=cost)
+            record_api_usage(doc=None, cnj=numero_cnj, service_key=service_key, endpoint=endpoint, http_status=status, items_count=0, cost_brl=cost)
 
     def status_atualizacao_processo(self, numero_cnj: str) -> Dict[str, Any]:
         """Consulta o status da última solicitação de atualização (se existir)."""
@@ -1122,6 +1173,8 @@ def process_inbox_once(client: EscavadorClient, max_items: int = 25) -> Dict[str
             for cnj in cnjs:
                 try:
                     client.criar_monitor_processo(cnj)
+                except EscavadorAlreadyMonitored:
+                    logger.info("Monitoramento já existia para CNJ %s", cnj)
                 except requests.HTTPError as e:
                     logger.warning("criar_monitor_processo(%s) warning: %s", cnj, str(e))
 
@@ -1191,6 +1244,9 @@ def poll_callbacks_loop(client: EscavadorClient):
                 len(pr.get("linked", [])),
             )
             _set_poll_state(last_totals={"inserted": inserted, "processed": pr["processed"], "errors": pr["errors"], "linked": len(pr.get("linked", []))}, last_finished=utcnow_iso())
+        except EscavadorUnauthorized as e:
+            logger.warning("Polling pausado por token não autorizado em /callbacks: %s", str(e)[:300])
+            _set_poll_state(last_error=str(e), last_finished=utcnow_iso())
         except Exception as e:
             logger.exception("Polling failed")
             _set_poll_state(last_error=str(e), last_finished=utcnow_iso())
@@ -1832,7 +1888,22 @@ def solicitar_atualizacao(cnj: str):
             )  # type: ignore
 
         _update_row_upsert(cnj, tipo, status="PENDENTE", last_error=None)
-        return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "result": res})
+        return jsonify({"ok": True, "cnj": cnj, "tipo": tipo, "result": res, "pending": True, "message": "Solicitação enviada ao Escavador. Atualização em andamento."})
+    except EscavadorUpdateAlreadyRunning as e:
+        payload_remote = e.payload if isinstance(e.payload, dict) else {}
+        ultima = (payload_remote.get("appends") or {}).get("ultima_verificacao") or {}
+        remote_status = ((ultima.get("status") or payload_remote.get("status") or "PENDENTE").strip().upper() if isinstance((ultima.get("status") or payload_remote.get("status") or "PENDENTE"), str) else "PENDENTE")
+        _update_row_upsert(cnj, tipo, status="PENDENTE", last_error=None, escavador_update_id=ultima.get("id"))
+        return jsonify({
+            "ok": True,
+            "cnj": cnj,
+            "tipo": tipo,
+            "pending": True,
+            "already_running": True,
+            "message": str(e),
+            "status": remote_status,
+            "ultima_verificacao": ultima,
+        }), 200
     except requests.HTTPError as e:
         status = getattr(e.response, "status_code", 500)
         msg = None
@@ -2088,7 +2159,7 @@ UI_BASE = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Blue Service | Monitor Escavador</title>
+  <title>Specter</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
     :root{
@@ -2195,6 +2266,20 @@ UI_BASE = """
       box-shadow: var(--shadow);
     }
     .side-title{ font-weight: 800; }
+    .summary-head{ display:flex; flex-wrap:wrap; align-items:flex-start; justify-content:space-between; gap:10px; }
+    .summary-main{ min-width:0; flex:1 1 180px; }
+    #badge-hoje{ display:flex; justify-content:flex-end; flex:0 0 auto; max-width:100%; }
+    .summary-metrics > [class*='col-']{ display:flex; min-width:0; }
+.summary-metrics .kpi{ width:100%; min-height:128px; }
+.summary-metrics .kpi .value{ white-space:normal; overflow-wrap:anywhere; word-break:break-word; }
+    .docs-note{ border:1px solid rgba(48,80,160,.16); border-radius:14px; background:rgba(48,80,160,.04); padding:10px 12px; }
+    @media (max-width: 991.98px){
+      .sticky-side{ position:static; }
+    }
+    @media (max-width: 575.98px){
+      .summary-head{ flex-direction:column; }
+      #badge-hoje{ justify-content:flex-start; }
+    }
     .divider{ border-color: var(--border); }
     .chip-click{
       cursor: pointer;
@@ -2378,12 +2463,13 @@ UI_BASE = """
 <nav class="navbar navbar-dark">
   <div class="container py-2 d-flex justify-content-between align-items-center">
     <div>
-      <div class="h4 mb-0">Blue Service | Monitor Escavador</div>
-      <div class="small" style="opacity:.9">Flask • SQLite • Movimentações em timeline</div>
+      <div class="h4 mb-0">Specter</div>
+      <div class="small" style="opacity:.9">Monitor jurídico local • Flask • SQLite • Movimentações em timeline</div>
     </div>
     <div class="d-flex gap-2">
       <a class="pill" href="/ui">Dashboard</a>
       <a class="pill" href="/ui/watchlist">Watch-List</a>
+      <a class="pill" href="/ui/admin/monitoramentos">Monitoramentos</a>
       <a class="pill" href="/ui/admin">Admin <span id="navBadge" class="badge bg-danger ms-1" style="display:none"></span></a>
       <a class="pill" href="/health">Health</a>
     </div>
@@ -3399,7 +3485,7 @@ def ui_processo(cnj: str):
 
     <div class="row g-3">
       <!-- Sidebar -->
-      <div class="col-lg-4">
+      <div class="col-lg-4 col-xl-3">
         <div class="sticky-side">
           <div class="side-card p-3 mb-3" id="side-summary">
             <div id="bn-summary" class="inline-banner"></div>
@@ -3464,7 +3550,7 @@ def ui_processo(cnj: str):
       </div>
 
       <!-- Main -->
-      <div class="col-lg-8">
+      <div class="col-lg-8 col-xl-9">
         <ul class="nav nav-tabs mb-3" role="tablist">
           <li class="nav-item" role="presentation">
             <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#pane-capa" type="button" role="tab">Capa</button>
@@ -3497,17 +3583,32 @@ def ui_processo(cnj: str):
           <div class="tab-pane fade" id="pane-pedmult" role="tabpanel">
             <div id="bn-pedmult" class="inline-banner mb-2"></div>
 
-            <div class="d-flex justify-content-between align-items-center mb-2">
-              <div class="muted small">Extraído da capa (quando disponível) e apresentado de forma consolidada.</div>
+            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+              <div class="muted small">Extraído da capa, movimentações e documentos (quando disponíveis) e apresentado de forma consolidada.</div>
               <button class="btn btn-outline-primary btn-mini" id="btn-pedmult-refresh">Recarregar</button>
             </div>
 
-            <div class="row g-2">
-              <div class="col-lg-6">
-                <div class="card p-3" id="pedidos-box"><span class="muted">Carregando pedidos…</span></div>
+            <ul class="nav nav-pills gap-2 mb-3" id="pedmult-subtabs" role="tablist">
+              <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="pm-tab-valores" data-bs-toggle="pill" data-bs-target="#pm-pane-valores" type="button" role="tab">Valores &amp; Custas</button>
+              </li>
+              <li class="nav-item" role="presentation">
+                <button class="nav-link" id="pm-tab-pedidos" data-bs-toggle="pill" data-bs-target="#pm-pane-pedidos" type="button" role="tab">Pedidos</button>
+              </li>
+              <li class="nav-item" role="presentation">
+                <button class="nav-link" id="pm-tab-multas" data-bs-toggle="pill" data-bs-target="#pm-pane-multas" type="button" role="tab">Multas</button>
+              </li>
+            </ul>
+
+            <div class="tab-content">
+              <div class="tab-pane fade show active" id="pm-pane-valores" role="tabpanel">
+                <div class="card p-3" id="valores-box" style="min-height:420px;"><span class="muted">Carregando valores…</span></div>
               </div>
-              <div class="col-lg-6">
-                <div class="card p-3" id="multas-box"><span class="muted">Carregando multas…</span></div>
+              <div class="tab-pane fade" id="pm-pane-pedidos" role="tabpanel">
+                <div class="card p-3" id="pedidos-box" style="min-height:420px;"><span class="muted">Carregando pedidos…</span></div>
+              </div>
+              <div class="tab-pane fade" id="pm-pane-multas" role="tabpanel">
+                <div class="card p-3" id="multas-box" style="min-height:420px;"><span class="muted">Carregando multas…</span></div>
               </div>
             </div>
           </div>
@@ -3581,6 +3682,17 @@ function esc(s){
 }
 
 // Converte valores vindos da API (que às vezes são objetos) em texto amigável
+function safeMoney(v){
+  if(v === null || v === undefined || v === "") return "";
+  if(typeof v === "number"){
+    try{ return new Intl.NumberFormat("pt-BR", {style:"currency", currency:"BRL"}).format(v); }catch(e){ return String(v); }
+  }
+  var s = safeText(v);
+  if(!s) return "";
+  var m = s.match(new RegExp("R\\$\\s*\\d{1,3}(?:\\.\\d{3})*,\\d{2}|\\d{1,3}(?:\\.\\d{3})*,\\d{2}"));
+  return m ? m[0].trim() : s;
+}
+
 function safeText(v){
   if(v === null || v === undefined) return "";
   if(typeof v === "number") return String(v);
@@ -3674,6 +3786,14 @@ function kpi(label, value, action){
   var attrs = act ? (' role="button" tabindex="0" data-action="' + esc(act) + '"') : "";
   var wrap = (txt && txt.length > 12) ? ' wrap' : '';
   return '<div class="col-6 col-lg-3"><div class="' + cls + '"' + attrs + '><div class="label">' + esc(label) + '</div><div class="value' + wrap + '">' + esc(txt || "") + '</div></div></div>';
+}
+function kpiSummary(label, value, action){
+  var txt = safeText(value);
+  var act = action ? String(action) : "";
+  var cls = act ? "kpi kpi-click" : "kpi";
+  var attrs = act ? (' role="button" tabindex="0" data-action="' + esc(act) + '"') : "";
+  var wrap = (txt && txt.length > 12) ? ' wrap' : '';
+  return '<div class="col-6"><div class="' + cls + '"' + attrs + '><div class="label">' + esc(label) + '</div><div class="value' + wrap + '">' + esc(txt || "") + '</div></div></div>';
 }
 function activateTab(target){
   try{
@@ -3865,8 +3985,8 @@ async function loadCapaPalatavel(){
 
   // Sidebar summary
   var resumoHtml = ""
-    + "<div class='d-flex justify-content-between align-items-start gap-2'>"
-    + "  <div>"
+    + "<div class='summary-head'>"
+    + "  <div class='summary-main'>"
     + "    <div class='muted small'>Resumo</div>"
     + "    <div class='side-title mono'>" + esc(d.numero_cnj || CNJ) + "</div>"
     + "  </div>"
@@ -3879,11 +3999,11 @@ async function loadCapaPalatavel(){
     + chip("UF", d.estado_origem)
     + "</div>"
     + "<hr class='divider'>"
-    + "<div class='row g-2'>"
-    + kpi("Movs", d.quantidade_movimentacoes || "", "movs")
-    + kpi("Última mov", formatDateBR(d.data_ultima_movimentacao || ""), "ultima")
-    + kpi("Verificado", formatDateBR(d.data_ultima_verificacao || ""), "verificado")
-    + kpi("Fontes", fontes.length, "fontes")
+    + "<div class='row g-2 summary-metrics'>"
+    + kpiSummary("Movimentações", d.quantidade_movimentacoes || "", "movs")
+    + kpiSummary("Última movimentação", formatDateBR(d.data_ultima_movimentacao || ""), "ultima")
+    + kpiSummary("Verificação", formatDateBR(d.data_ultima_verificacao || ""), "verificado")
+    + kpiSummary("Fontes", fontes.length, "fontes")
     + "</div>"
     + "<div class='muted small mt-2'>Dica: use os chips de tipo para focar a timeline.</div>";
 
@@ -4081,8 +4201,18 @@ async function loadDocs(){
   if(!Array.isArray(items) || items.length === 0){
     var hint = "Nenhum documento encontrado no cache.";
     if(j.warning) hint += " " + esc(j.warning);
-    hint += " Se você acabou de adicionar o processo, clique em <b>Atualizar no tribunal</b> para baixar " + (tipo==="autos" ? "os autos" : "documentos públicos") + ".";
-    box.innerHTML = "<div class='muted'>" + hint + "</div>";
+    var extra = tipo==="autos"
+      ? "Autos podem exigir login, senha ou certificado configurados no Escavador para o tribunal deste processo."
+      : "Se a atualização já foi solicitada, o tribunal ou o Escavador ainda podem estar processando os documentos públicos.";
+    box.innerHTML = "<div class='docs-note'>"
+      + "<div class='fw-semibold mb-1'>Ainda sem documentos disponíveis</div>"
+      + "<div class='small text-muted mb-2'>" + hint + "</div>"
+      + "<ul class='small mb-0 ps-3'>"
+      + "<li>Use <b>Atualizar no tribunal</b> e aguarde a conclusão do processamento.</li>"
+      + "<li>Depois clique em <b>Recarregar</b> para consultar o cache novamente.</li>"
+      + "<li>" + extra + "</li>"
+      + "</ul>"
+      + "</div>";
     return;
   }
 
@@ -4176,6 +4306,17 @@ async function requestDocsUpdate(){
       showInlineBanner("bn-docs","danger","Falha ao solicitar", esc(j.message || j.error || ("HTTP " + r.status)));
       return;
     }
+    if(j.already_running || j.pending){
+      var pendingMsg = j.already_running
+        ? "O Escavador informou que a atualização já estava em andamento. Vou acompanhar o status."
+        : "Solicitação aceita. Aguardando processamento…";
+      if(tipo_ui === "autos"){
+        pendingMsg += " Autos podem exigir credenciais ou certificado do tribunal.";
+      }
+      showInlineBanner("bn-docs","info", j.already_running ? "Atualização já em andamento" : "Atualização solicitada", esc(pendingMsg));
+      await pollDocsStatus(tipo_ui);
+      return;
+    }
     showInlineBanner("bn-docs","info","Atualização solicitada","Aguardando processamento…");
     await pollDocsStatus(tipo_ui);
   }catch(e){
@@ -4240,83 +4381,157 @@ function objToPairs(o){
   return keys.map(function(k){ return [k, o[k]]; });
 }
 
-function renderCards(title, items){
-  var arr = Array.isArray(items) ? items : [];
-  if(arr.length === 0){
-    return "<div class='d-flex justify-content-between align-items-center mb-2'>"
-      + "<div class='h6 mb-0'>" + esc(title) + "</div>"
-      + "<span class='badge-soft p-2'>0</span>"
-      + "</div>"
-      + "<div class='muted'>Nada encontrado.</div>";
-  }
-  var html = "<div class='d-flex justify-content-between align-items-center mb-2'>"
+function cardHeader(title, count){
+  return "<div class='d-flex justify-content-between align-items-center mb-2'>"
     + "<div class='h6 mb-0'>" + esc(title) + "</div>"
-    + "<span class='badge-soft p-2'>" + esc(String(arr.length)) + "</span>"
+    + "<span class='badge-soft p-2'>" + esc(String(count)) + "</span>"
     + "</div>";
-  html += "<div class='d-grid gap-2'>";
+}
+
+function tagChip(text){
+  var t = safeText(text);
+  if(!t) return "";
+  return "<span style='display:inline-block;padding:4px 8px;border:1px solid var(--border);border-radius:999px;background:rgba(48,80,160,.05);font-size:12px;'>" + esc(t) + "</span>";
+}
+
+function excelHeader(title, count, columns){
+  var cols = Array.isArray(columns) ? columns : [];
+  var html = cardHeader(title, count);
+  html += "<div style='overflow:auto;border:1px solid var(--border);border-radius:16px;background:#fff;'>";
+  html += "<table class='table table-sm align-middle mb-0' style='min-width:980px;'>";
+  html += "<thead style='position:sticky;top:0;background:#f7f9fc;z-index:1;'><tr>";
+  for(var i=0;i<cols.length;i++){
+    var align = cols[i] === 'Valor' ? "right" : 'left';
+    html += "<th style='white-space:nowrap;padding:12px 10px;border-bottom:1px solid var(--border);text-align:" + align + ";font-size:12px;color:#5b6b86;text-transform:uppercase;letter-spacing:.03em;'>" + esc(cols[i]) + "</th>";
+  }
+  html += "</tr></thead><tbody>";
+  return html;
+}
+
+function excelFooter(){
+  return "</tbody></table></div>";
+}
+
+function tdCell(value, opts){
+  opts = opts || {};
+  var align = opts.align || 'left';
+  var nowrap = opts.nowrap ? ';white-space:nowrap;' : '';
+  var mono = opts.mono ? 'mono' : '';
+  return "<td class='" + mono + "' style='padding:10px;border-bottom:1px solid #eef2f7;text-align:" + align + nowrap + "vertical-align:top;'>" + (value || "<span class='muted'>-</span>") + "</td>";
+}
+
+function compactText(s, max){
+  var t = safeText(s || '');
+  max = max || 180;
+  if(!t) return '';
+  return t.length > max ? t.slice(0, max-1) + '…' : t;
+}
+
+function renderStandardCards(title, items){
+  var arr = Array.isArray(items) ? items : [];
+  if(arr.length === 0) return cardHeader(title, 0) + "<div class='muted'>Nada encontrado.</div>";
+  var html = excelHeader(title, arr.length, ['Tipo', 'Descrição', 'Origem', 'Data', 'Trecho']);
   for(var i=0;i<arr.length;i++){
     var it = arr[i];
-    if(typeof it === "string" || typeof it === "number" || typeof it === "boolean"){
-      html += "<div class='p-2' style='border:1px solid var(--border); border-radius:14px; background:rgba(48,80,160,.03);'>"
-           + "<div class='wrap'>" + esc(String(it)) + "</div></div>";
-      continue;
+    var tipo = '';
+    var descricao = '';
+    var origem = '';
+    var data = '';
+    var trecho = '';
+    if(typeof it === 'string' || typeof it === 'number' || typeof it === 'boolean'){
+      descricao = String(it);
+      trecho = descricao;
+    } else if(it && typeof it === 'object'){
+      tipo = safeText(it.tipo || it.pedido || it.multa || '');
+      descricao = safeText(it.descricao || it.texto || '');
+      origem = safeText(it.origem || '');
+      data = safeText(it.data || '');
+      trecho = safeText(it.trecho || it.contexto || it.texto || it.descricao || '');
+      if(!tipo && !descricao && !trecho){
+        trecho = JSON.stringify(it);
+      }
+    } else {
+      descricao = 'Item inválido';
     }
-    if(!it || typeof it !== "object"){
-      html += "<div class='p-2 muted' style='border:1px solid var(--border); border-radius:14px;'>Item inválido</div>";
-      continue;
-    }
-    var pairs = objToPairs(it);
-    var head = "";
-    var titleGuess = safeText(it.descricao || it.pedido || it.multa || it.tipo || "");
-    if(titleGuess){
-      head = "<div style='font-weight:800' class='mb-1'>" + esc(titleGuess) + "</div>";
-    }
-    var rows = "";
-    for(var p=0;p<pairs.length;p++){
-      var k = pairs[p][0];
-      var v = pairs[p][1];
-      if(v === null || v === undefined || v === "") continue;
-      var vv = (String(k).toLowerCase().includes("valor")) ? safeMoney(v) : safeText(v);
-      if(!vv) continue;
-      rows += "<div class='d-flex justify-content-between gap-2 py-1' style='border-top:1px dashed rgba(0,0,0,.08);'>"
-           + "<div class='muted small' style='min-width:120px'>" + esc(k) + "</div>"
-           + "<div class='mono small text-end wrap' style='max-width:70%'>" + esc(vv) + "</div>"
-           + "</div>";
-    }
-    if(!rows){
-      rows = "<div class='muted small'>Sem campos estruturados; exibindo JSON.</div>"
-           + "<pre class='small mb-0'>" + esc(JSON.stringify(it, null, 2)) + "</pre>";
-    }
-    html += "<div class='p-2' style='border:1px solid var(--border); border-radius:14px; background:rgba(48,80,160,.03);'>"
-         + head + rows + "</div>";
+    html += '<tr>'
+      + tdCell(esc(tipo || title.slice(0,-1) || 'Item'), {nowrap:true})
+      + tdCell("<div class='wrap'>" + esc(compactText(descricao, 140)) + "</div>")
+      + tdCell(origem ? tagChip(origem) : '')
+      + tdCell(esc(data), {nowrap:true})
+      + tdCell("<div class='wrap small'>" + esc(compactText(trecho, 240)) + "</div>")
+      + '</tr>';
   }
-  html += "</div>";
+  html += excelFooter();
   return html;
+}
+
+function renderValueCards(title, items){
+  var arr = Array.isArray(items) ? items : [];
+  if(arr.length === 0) return cardHeader(title, 0) + "<div class='muted'>Nada encontrado.</div>";
+  var html = excelHeader(title, arr.length, ['Tipo', 'Valor', 'Descrição', 'Origem', 'Data', 'Trecho']);
+  for(var i=0;i<arr.length;i++){
+    var it = arr[i] || {};
+    if(typeof it !== 'object'){
+      it = { tipo: 'Valor', valor: safeMoney(it), descricao: String(it), trecho: String(it) };
+    }
+    var tipo = safeText(it.tipo || 'Valor');
+    var descricao = safeText(it.descricao || '');
+    var valor = safeMoney(it.valor_formatado || it.valor || '');
+    var origem = safeText(it.origem || '');
+    var data = safeText(it.data || '');
+    var trecho = safeText(it.trecho || it.contexto || it.descricao || '');
+    html += '<tr>'
+      + tdCell("<strong>" + esc(tipo) + "</strong>", {nowrap:true})
+      + tdCell(valor ? esc(valor) : '', {align:'right', nowrap:true, mono:true})
+      + tdCell("<div class='wrap'>" + esc(compactText(descricao, 140)) + "</div>")
+      + tdCell(origem ? tagChip(origem) : '')
+      + tdCell(esc(data), {nowrap:true})
+      + tdCell("<div class='wrap small'>" + esc(compactText(trecho, 240)) + "</div>")
+      + '</tr>';
+  }
+  html += excelFooter();
+  return html;
+}
+
+function renderCards(title, items){
+  return (title === 'Valores & Custas') ? renderValueCards(title, items) : renderStandardCards(title, items);
 }
 
 async function loadPedidosMultas(force){
   clearInlineBanner("bn-pedmult");
   var pedidosBox = document.getElementById("pedidos-box");
   var multasBox = document.getElementById("multas-box");
+  var valoresBox = document.getElementById("valores-box");
   pedidosBox.innerHTML = '<span class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando…</span>';
   multasBox.innerHTML  = '<span class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando…</span>';
+  valoresBox.innerHTML = '<span class="muted"><span class="spinner-border spinner-border-sm me-2"></span>Carregando…</span>';
 
   try{
     var url = "/ui/api/processo/" + encodeURIComponent(CNJ) + "/pedidos-multas";
     if(force) url += "?refresh=1";
     var r = await fetch(url);
-    var j = await r.json();
+    var raw = await r.text();
+    var j = {};
+    try{ j = JSON.parse(raw); } catch(parseErr){
+      showInlineBanner("bn-pedmult","danger","Falha ao carregar","Resposta não-JSON do servidor.");
+      pedidosBox.innerHTML = "<div class='muted'>Falha.</div>";
+      multasBox.innerHTML = "<div class='muted'>Falha.</div>";
+      valoresBox.innerHTML = "<div class='muted'>Falha.</div>";
+      return;
+    }
     if(!j.ok){
       var msg = esc(j.message || j.error || ("HTTP " + r.status));
       showInlineBanner("bn-pedmult","warning","Falha ao carregar", msg);
       pedidosBox.innerHTML = "<div class='muted'>Sem dados.</div>";
       multasBox.innerHTML = "<div class='muted'>Sem dados.</div>";
+      valoresBox.innerHTML = "<div class='muted'>Sem dados.</div>";
       return;
     }
     pedidosBox.innerHTML = renderCards("Pedidos", j.pedidos || []);
     multasBox.innerHTML = renderCards("Multas", j.multas || []);
-    if((j.pedidos||[]).length === 0 && (j.multas||[]).length === 0){
-      showInlineBanner("bn-pedmult","info","Sem registros","A capa não retornou pedidos/multas para este CNJ (ou a fonte não disponibiliza).");
+    valoresBox.innerHTML = renderCards("Valores & Custas", j.valores || []);
+    if((j.pedidos||[]).length === 0 && (j.multas||[]).length === 0 && (j.valores||[]).length === 0){
+      showInlineBanner("bn-pedmult","info","Sem registros","Não localizei pedidos, multas ou valores relevantes na capa, nas movimentações ou nos documentos já disponíveis para este CNJ.");
     } else if(j.cached){
       try{ showToast("info","Pedidos & Multas", j.stale ? "Cache (stale) usado" : "Cache usado", 2200); }catch(e){}
     }
@@ -4324,6 +4539,7 @@ async function loadPedidosMultas(force){
     showInlineBanner("bn-pedmult","danger","Erro ao carregar", esc(e.toString()));
     pedidosBox.innerHTML = "<div class='muted'>Falha.</div>";
     multasBox.innerHTML = "<div class='muted'>Falha.</div>";
+    valoresBox.innerHTML = "<div class='muted'>Falha.</div>";
   }
 }
 document.getElementById("prev").addEventListener("click", function(){
@@ -4531,7 +4747,7 @@ def ui_api_capa(cnj: str):
 
     def _get_cached():
         try:
-            with db_conn() as conn:
+            with db_connect() as conn:
                 conn.row_factory = sqlite3.Row
                 cur = conn.cursor()
                 cur.execute("SELECT payload, updated_at FROM capa_cache WHERE cnj=?", (cnj,))
@@ -4551,7 +4767,7 @@ def ui_api_capa(cnj: str):
 
     def _set_cached(payload: dict):
         try:
-            with db_conn() as conn:
+            with db_connect() as conn:
                 cur = conn.cursor()
                 cur.execute(
                     "INSERT INTO capa_cache(cnj,payload,updated_at) VALUES(?,?,?) "
@@ -4595,6 +4811,7 @@ def _collect_key_anywhere(obj: Any, keys: set) -> List[Any]:
                 out.extend(_collect_key_anywhere(it, keys))
     return out
 
+
 def _normalize_to_list(v: Any) -> List[Any]:
     if v is None:
         return []
@@ -4603,6 +4820,259 @@ def _normalize_to_list(v: Any) -> List[Any]:
     if isinstance(v, dict):
         return [v]
     return [v]
+
+
+def _flatten_strings(obj: Any, limit: int = 5000) -> List[str]:
+    out: List[str] = []
+
+    def walk(x: Any):
+        if len(out) >= limit:
+            return
+        if x is None:
+            return
+        if isinstance(x, str):
+            s = re.sub(r"\s+", " ", x).strip()
+            if s:
+                out.append(s)
+            return
+        if isinstance(x, (int, float, bool)):
+            out.append(str(x))
+            return
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+            return
+        if isinstance(x, list):
+            for it in x:
+                walk(it)
+
+    walk(obj)
+    return out
+
+
+_PEDIDO_PATTERNS = [
+    (re.compile(r"pedido(?:s)?[:\-\s]*(.{0,180})", re.I), "Pedido"),
+    (re.compile(r"requer(?:eu|imento|imentos)?[:\-\s]*(.{0,180})", re.I), "Requerimento"),
+    (re.compile(r"liminar.{0,180}", re.I), "Liminar"),
+    (re.compile(r"tutela(?:\s+de\s+urg[eê]ncia|\s+antecipada)?.{0,180}", re.I), "Tutela"),
+    (re.compile(r"indeniza[cç][aã]o.{0,180}", re.I), "Indenização"),
+    (re.compile(r"danos?\s+(?:morais|materiais).{0,180}", re.I), "Danos"),
+    (re.compile(r"obriga[cç][aã]o\s+de\s+fazer.{0,180}", re.I), "Obrigação de fazer"),
+    (re.compile(r"embargos?.{0,180}", re.I), "Embargos"),
+    (re.compile(r"execu[cç][aã]o.{0,180}", re.I), "Execução"),
+]
+
+_MULTA_PATTERNS = [
+    (re.compile(r"multa.{0,180}", re.I), "Multa"),
+    (re.compile(r"astreintes.{0,180}", re.I), "Astreintes"),
+    (re.compile(r"cl[aá]usula\s+penal.{0,180}", re.I), "Cláusula penal"),
+    (re.compile(r"40%\s+do\s+fgts.{0,180}", re.I), "Multa FGTS 40%"),
+    (re.compile(r"art(?:igo)?\.?\s*467\s+da\s+clt.{0,180}", re.I), "Multa art. 467 CLT"),
+    (re.compile(r"art(?:igo)?\.?\s*477\s+da\s+clt.{0,180}", re.I), "Multa art. 477 CLT"),
+]
+
+
+_VALOR_PATTERNS = [
+    (re.compile(r"\bcustas?\b.{0,120}", re.I), "Custas"),
+    (re.compile(r"\bhonor[aá]rios?\b.{0,120}", re.I), "Honorários"),
+    (re.compile(r"\bvalor\s+da\s+causa\b.{0,120}", re.I), "Valor da causa"),
+    (re.compile(r"\bindeniza[cç][aã]o\b.{0,120}", re.I), "Indenização"),
+    (re.compile(r"\bcondena[cç][aã]o\b.{0,120}", re.I), "Condenação"),
+    (re.compile(r"\bpenhora\b.{0,120}", re.I), "Penhora"),
+    (re.compile(r"\bbloqueio\b.{0,120}", re.I), "Bloqueio"),
+    (re.compile(r"\bdep[oó]sito\b.{0,120}", re.I), "Depósito"),
+]
+
+_MONEY_RX = re.compile(r"(R\$\s*\d{1,3}(?:\.\d{3})*,\d{2}|R\$\s*\d+,\d{2}|\d{1,3}(?:\.\d{3})*,\d{2})", re.I)
+
+
+
+
+def _maybe_contains_money_or_keyword(text: str) -> bool:
+    if not text:
+        return False
+    s = str(text)
+    low = s.lower()
+    if 'r$' in low:
+        return True
+    if re.search(r"\b\d{1,3}(?:\.\d{3})*,\d{2}\b", s):
+        return True
+    keywords = (
+        'custa', 'honor', 'multa', 'astreinte', 'indeniza', 'condena',
+        'valor da causa', 'penhora', 'bloque', 'sisba', 'bacen', 'depósito', 'deposito'
+    )
+    return any(k in low for k in keywords)
+
+def _extract_money_mentions(text: str, source: str, data_ref: Optional[str] = None) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    base = re.sub(r"\s+", " ", text).strip()
+    out: List[Dict[str, Any]] = []
+    for m in _MONEY_RX.finditer(base):
+        amount = m.group(1).strip()
+        start = max(0, m.start() - 100)
+        end = min(len(base), m.end() + 100)
+        trecho = base[start:end].strip(" .;:-")
+        tipo = "Valor"
+        low = trecho.lower()
+        if "custa" in low:
+            tipo = "Custas"
+        elif "honor" in low:
+            tipo = "Honorários"
+        elif "multa" in low:
+            tipo = "Multa"
+        elif "astreinte" in low:
+            tipo = "Astreintes"
+        elif "indeniza" in low:
+            tipo = "Indenização"
+        elif "valor da causa" in low:
+            tipo = "Valor da causa"
+        elif "condena" in low:
+            tipo = "Condenação"
+        elif "penhor" in low:
+            tipo = "Penhora"
+        elif "bloque" in low or "sisba" in low or "bacen" in low:
+            tipo = "Bloqueio"
+        out.append({
+            "tipo": tipo,
+            "descricao": trecho,
+            "valor": amount if amount.upper().startswith("R$") else f"R$ {amount}",
+            "origem": source,
+            "data": data_ref or "",
+        })
+    return out
+
+
+def _extract_keyword_values(text: str, source: str, data_ref: Optional[str] = None) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    base = re.sub(r"\s+", " ", text).strip()
+    out: List[Dict[str, Any]] = []
+    for rx, label in _VALOR_PATTERNS:
+        for m in rx.finditer(base):
+            trecho = m.group(0).strip(" .;:-")
+            if not trecho:
+                continue
+            money = _MONEY_RX.search(trecho)
+            out.append({
+                "tipo": label,
+                "descricao": trecho,
+                "valor": (money.group(1).strip() if money else ""),
+                "origem": source,
+                "data": data_ref or "",
+            })
+    return out
+
+
+def _extract_matches_from_text(text: str, source: str, kind: str, data_ref: Optional[str] = None) -> List[Dict[str, Any]]:
+    if not text:
+        return []
+    patterns = _PEDIDO_PATTERNS if kind == "pedido" else _MULTA_PATTERNS
+    out: List[Dict[str, Any]] = []
+    base = re.sub(r"\s+", " ", text).strip()
+    for rx, label in patterns:
+        for m in rx.finditer(base):
+            trecho = m.group(0).strip(" .;:-")
+            if not trecho:
+                continue
+            out.append({
+                "tipo": label,
+                "descricao": trecho,
+                "origem": source,
+                "data": data_ref or "",
+            })
+    return out
+
+
+def _dedupe_any(items: List[Any]) -> List[Any]:
+    seen = set()
+    out = []
+    for it in items:
+        try:
+            if isinstance(it, (dict, list)):
+                h = stable_hash(it)
+            else:
+                h = stable_hash({"v": str(it)})
+        except Exception:
+            h = str(it)
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append(it)
+    return out
+
+
+def _looks_like_money_scalar(v: Any) -> bool:
+    if v is None:
+        return False
+    s = str(v).strip()
+    if not s:
+        return False
+    if _MONEY_RX.search(s):
+        return True
+    if re.fullmatch(r"\d+[.,]\d{2,4}", s):
+        return True
+    return False
+
+
+def _format_scalar_money(v: Any) -> str:
+    s = str(v).strip()
+    if not s:
+        return ""
+    m = _MONEY_RX.search(s)
+    if m:
+        raw = m.group(1).strip()
+        return raw if raw.upper().startswith("R$") else f"R$ {raw}"
+    if re.fullmatch(r"\d+[.,]\d{2,4}", s):
+        try:
+            num = float(s.replace('.', '').replace(',', '.')) if ',' in s and '.' in s else float(s.replace(',', '.'))
+            inte = int(num)
+            dec = f"{num:.2f}".split('.')[-1]
+            inteiro_fmt = f"{inte:,}".replace(',', '.')
+            return f"R$ {inteiro_fmt},{dec}"
+        except Exception:
+            return s
+    return s
+
+
+def _normalize_valor_item(v: Any) -> Optional[Dict[str, Any]]:
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        tipo = str(v.get("tipo") or v.get("natureza") or "Valor").strip() or "Valor"
+        descricao = str(v.get("descricao") or v.get("titulo") or v.get("texto") or "").strip()
+        valor_raw = v.get("valor_formatado") or v.get("valor") or v.get("valor_causa") or v.get("custas") or v.get("honorarios") or v.get("honorários")
+        moeda = str(v.get("moeda") or "R$").strip()
+        origem = str(v.get("origem") or "").strip()
+        data = str(v.get("data") or "").strip()
+        if valor_raw is None:
+            for k, vv in v.items():
+                if any(token in str(k).lower() for token in ["valor", "custa", "honor", "multa", "inden", "conden"]):
+                    valor_raw = vv
+                    break
+        if valor_raw is None and not descricao:
+            return None
+        valor_fmt = _format_scalar_money(valor_raw) if valor_raw is not None else ""
+        if not valor_fmt and not descricao:
+            return None
+        return {
+            "tipo": tipo,
+            "descricao": descricao,
+            "valor": valor_fmt,
+            "origem": origem,
+            "data": data,
+            "moeda": moeda,
+        }
+    if isinstance(v, (int, float)):
+        if isinstance(v, int):
+            return None
+        return {"tipo": "Valor", "descricao": "", "valor": _format_scalar_money(v), "origem": "capa", "data": ""}
+    s = str(v).strip()
+    if not _looks_like_money_scalar(s):
+        return None
+    return {"tipo": "Valor", "descricao": "", "valor": _format_scalar_money(s), "origem": "capa", "data": ""}
+
+
 
 @app.get("/ui/api/processo/<path:cnj>/pedidos-multas")
 def ui_api_pedidos_multas(cnj: str):
@@ -4613,9 +5083,9 @@ def ui_api_pedidos_multas(cnj: str):
     refresh = (request.args.get("refresh") or "").strip() in ("1", "true", "yes")
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    def _get_cached():
+    def _get_cached_capa():
         try:
-            with db_conn() as conn:
+            with db_connect() as conn:
                 conn.row_factory = sqlite3.Row
                 cur = conn.cursor()
                 cur.execute("SELECT payload, updated_at FROM capa_cache WHERE cnj=?", (cnj,))
@@ -4630,13 +5100,13 @@ def ui_api_pedidos_multas(cnj: str):
                 payload = json.loads(r["payload"])
                 if ts and (datetime.now(timezone.utc) - ts).total_seconds() <= CAPA_CACHE_TTL_SECONDS:
                     return payload, False
-                return payload, True  # stale
+                return payload, True
         except Exception:
             return None, None
 
-    def _set_cached(payload: dict):
+    def _set_cached_capa(payload: dict):
         try:
-            with db_conn() as conn:
+            with db_connect() as conn:
                 cur = conn.cursor()
                 cur.execute(
                     "INSERT INTO capa_cache(cnj,payload,updated_at) VALUES(?,?,?) "
@@ -4649,7 +5119,7 @@ def ui_api_pedidos_multas(cnj: str):
 
     cached_payload, is_stale = (None, None)
     if not refresh:
-        cached_payload, is_stale = _get_cached()
+        cached_payload, is_stale = _get_cached_capa()
 
     data = None
     used_cache = False
@@ -4662,7 +5132,7 @@ def ui_api_pedidos_multas(cnj: str):
         else:
             try:
                 data = client.obter_capa_processo(cnj)  # type: ignore[attr-defined]
-                _set_cached(data)
+                _set_cached_capa(data)
             except requests.RequestException as e:
                 _set_last_api_error(method="GET", path="/processos/{cnj}", status=None, message=str(e))
                 if cached_payload is not None:
@@ -4674,10 +5144,10 @@ def ui_api_pedidos_multas(cnj: str):
     else:
         try:
             data = client.obter_capa_processo(cnj)  # type: ignore[attr-defined]
-            _set_cached(data)
+            _set_cached_capa(data)
         except requests.RequestException as e:
             _set_last_api_error(method="GET", path="/processos/{cnj}", status=None, message=str(e))
-            cached_payload, _st = _get_cached()
+            cached_payload, _st = _get_cached_capa()
             if cached_payload is not None:
                 data = cached_payload
                 used_cache = True
@@ -4695,25 +5165,96 @@ def ui_api_pedidos_multas(cnj: str):
     for v in multas_vals:
         multas.extend(_normalize_to_list(v))
 
-    def _dedupe(items: List[Any]) -> List[Any]:
-        seen = set()
-        out = []
-        for it in items:
-            try:
-                if isinstance(it, (dict, list)):
-                    h = stable_hash(it)
-                else:
-                    h = stable_hash({"v": str(it)})
-            except Exception:
-                h = str(it)
-            if h in seen:
-                continue
-            seen.add(h)
-            out.append(it)
-        return out
+    # Heurística complementar: examina capa, movimentações locais e documentos já baixados/cacheados.
+    text_sources: List[Tuple[str, str, Optional[str]]] = []
+    for s in _flatten_strings(data):
+        if len(s) >= 12:
+            text_sources.append(("capa", s, None))
 
-    pedidos = _dedupe(pedidos)
-    multas = _dedupe(multas)
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT data, tipo, texto, raw_json FROM eventos_mov WHERE cnj=? ORDER BY COALESCE(data,'') DESC LIMIT 1000",
+                (cnj,),
+            )
+            for row in cur.fetchall() or []:
+                parts = []
+                if row["tipo"]:
+                    parts.append(str(row["tipo"]))
+                if row["texto"]:
+                    parts.append(str(row["texto"]))
+                merged = " | ".join([p for p in parts if p])
+                if merged:
+                    text_sources.append(("movimentação", merged, row["data"]))
+                if row["raw_json"]:
+                    try:
+                        raw_obj = json.loads(row["raw_json"])
+                        for s in _flatten_strings(raw_obj, limit=120):
+                            if _maybe_contains_money_or_keyword(s):
+                                text_sources.append(("movimentação", s, row["data"]))
+                    except Exception:
+                        raw_s = str(row["raw_json"])
+                        if _maybe_contains_money_or_keyword(raw_s):
+                            text_sources.append(("movimentação", raw_s, row["data"]))
+        except Exception:
+            pass
+        try:
+            cur.execute(
+                "SELECT tipo, titulo, data, meta_json FROM documentos_cache WHERE cnj=? ORDER BY COALESCE(data,'') DESC LIMIT 200",
+                (cnj,),
+            )
+            for row in cur.fetchall() or []:
+                parts = []
+                if row["titulo"]:
+                    parts.append(str(row["titulo"]))
+                if row["meta_json"]:
+                    try:
+                        parts.extend(_flatten_strings(json.loads(row["meta_json"]), limit=80))
+                    except Exception:
+                        parts.append(str(row["meta_json"]))
+                merged = " | ".join([p for p in parts if p])
+                if merged:
+                    origem = "documento" if row["tipo"] == "documentos_publicos" else "autos"
+                    text_sources.append((origem, merged, row["data"]))
+        except Exception:
+            pass
+
+    extracted_pedidos: List[Dict[str, Any]] = []
+    extracted_multas: List[Dict[str, Any]] = []
+    extracted_valores: List[Dict[str, Any]] = []
+    for source, txt, dt in text_sources:
+        extracted_pedidos.extend(_extract_matches_from_text(txt, source, "pedido", dt))
+        extracted_multas.extend(_extract_matches_from_text(txt, source, "multa", dt))
+        extracted_valores.extend(_extract_keyword_values(txt, source, dt))
+        extracted_valores.extend(_extract_money_mentions(txt, source, dt))
+
+    pedidos.extend(extracted_pedidos)
+    multas.extend(extracted_multas)
+
+    valores: List[Any] = []
+    for v in _collect_key_anywhere(data, {"valor", "valor_formatado", "valor_causa", "custas", "honorarios", "honorários"}):
+        valores.extend(_normalize_to_list(v))
+    valores.extend(extracted_valores)
+
+    valores_norm: List[Dict[str, Any]] = []
+    for item in valores:
+        norm = _normalize_valor_item(item)
+        if norm:
+            valores_norm.append(norm)
+
+    def _valor_sort_key(x: Dict[str, Any]):
+        origem = (x.get("origem") or "").lower()
+        prioridade = {"movimentação": 0, "documento": 1, "autos": 2, "capa": 3}.get(origem, 9)
+        data = x.get("data") or ""
+        return (prioridade, str(data))
+
+    valores_norm.sort(key=_valor_sort_key)
+
+    pedidos = _dedupe_any(pedidos)
+    multas = _dedupe_any(multas)
+    valores = _dedupe_any(valores_norm)
 
     return jsonify({
         "ok": True,
@@ -4721,6 +5262,8 @@ def ui_api_pedidos_multas(cnj: str):
         "stale": bool(stale_used),
         "pedidos": pedidos,
         "multas": multas,
+        "valores": valores,
+        "fontes": sorted(list({src for src, _, _ in text_sources})),
     })
 
 
@@ -4730,6 +5273,8 @@ def ui_admin():
     <div class="card p-3">
       <div class="h5 mb-1">Admin</div>
       <div class="muted">Ajustes operacionais do monitor (auto-discover, saúde, diagnósticos).</div>
+
+      <div class="mt-3"><a class="btn btn-outline-primary btn-sm" href="/ui/admin/monitoramentos">Abrir Monitoramentos</a></div>
 
       <hr class="divider">
 
@@ -5883,6 +6428,512 @@ def ui_api_alerts_export_csv():
         ])
     out = buf.getvalue()
     return Response(out, mimetype="text/csv; charset=utf-8")
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (name,))
+    return cur.fetchone() is not None
+
+
+def _list_local_monitoramentos() -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                p.cnj,
+                p.created_at,
+                p.last_sync_at,
+                p.last_event_at,
+                COUNT(DISTINCT dp.doc) AS links_count,
+                GROUP_CONCAT(DISTINCT dp.doc) AS docs_csv,
+                COUNT(DISTINCT ev.id) AS eventos_count
+            FROM processos p
+            LEFT JOIN doc_process dp ON dp.cnj = p.cnj
+            LEFT JOIN eventos_mov ev ON ev.cnj = p.cnj
+            GROUP BY p.cnj, p.created_at, p.last_sync_at, p.last_event_at
+            ORDER BY COALESCE(p.last_event_at, p.last_sync_at, p.created_at) DESC, p.cnj ASC
+        """)
+        rows = []
+        for r in cur.fetchall():
+            item = dict(r)
+            docs = [d for d in (item.get("docs_csv") or "").split(",") if d]
+            item["docs"] = docs
+            item["is_orfao_local"] = len(docs) == 0
+            rows.append(item)
+        return rows
+
+
+def _list_watchlist_local() -> list[dict]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                w.id, w.doc, w.tipo_doc, w.created_at,
+                COUNT(DISTINCT dp.cnj) AS processos_count
+            FROM watchlist w
+            LEFT JOIN doc_process dp ON dp.doc = w.doc
+            GROUP BY w.id, w.doc, w.tipo_doc, w.created_at
+            ORDER BY w.id DESC
+        """)
+        return [dict(r) for r in cur.fetchall()]
+
+
+def _cleanup_local_processo(cnj: str) -> dict:
+    cnj = (cnj or "").strip()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM eventos_mov WHERE cnj=?", (cnj,))
+        eventos = cur.rowcount or 0
+        cur.execute("DELETE FROM documentos_cache WHERE cnj=?", (cnj,))
+        docs_cache = cur.rowcount or 0
+        cur.execute("DELETE FROM processo_updates WHERE cnj=?", (cnj,))
+        updates = cur.rowcount or 0
+        cur.execute("DELETE FROM doc_process WHERE cnj=?", (cnj,))
+        links = cur.rowcount or 0
+        cur.execute("DELETE FROM processos WHERE cnj=?", (cnj,))
+        processos = cur.rowcount or 0
+        conn.commit()
+    return {"cnj": cnj, "deleted_processos": processos, "deleted_links": links, "deleted_eventos": eventos, "deleted_docs_cache": docs_cache, "deleted_updates": updates}
+
+
+def _cleanup_local_doc(doc: str) -> dict:
+    doc = normalize_doc(doc)
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT cnj FROM doc_process WHERE doc=?", (doc,))
+        cnjs = [r[0] for r in cur.fetchall()]
+        cur.execute("DELETE FROM doc_process WHERE doc=?", (doc,))
+        links = cur.rowcount or 0
+        cur.execute("DELETE FROM watchlist WHERE doc=?", (doc,))
+        watch = cur.rowcount or 0
+        deleted_orfaos = 0
+        for cnj in cnjs:
+            cur.execute("SELECT 1 FROM doc_process WHERE cnj=? LIMIT 1", (cnj,))
+            if cur.fetchone() is None:
+                cur.execute("DELETE FROM eventos_mov WHERE cnj=?", (cnj,))
+                cur.execute("DELETE FROM documentos_cache WHERE cnj=?", (cnj,))
+                cur.execute("DELETE FROM processo_updates WHERE cnj=?", (cnj,))
+                cur.execute("DELETE FROM processos WHERE cnj=?", (cnj,))
+                deleted_orfaos += cur.rowcount or 0
+        conn.commit()
+    return {"doc": doc, "deleted_watchlist": watch, "deleted_links": links, "deleted_orphan_processes": deleted_orfaos}
+
+
+def _cleanup_local_orfaos() -> dict:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT p.cnj FROM processos p LEFT JOIN doc_process dp ON dp.cnj = p.cnj WHERE dp.cnj IS NULL")
+        cnjs = [r[0] for r in cur.fetchall()]
+        total = 0
+        for cnj in cnjs:
+            cur.execute("DELETE FROM eventos_mov WHERE cnj=?", (cnj,))
+            cur.execute("DELETE FROM documentos_cache WHERE cnj=?", (cnj,))
+            cur.execute("DELETE FROM processo_updates WHERE cnj=?", (cnj,))
+            cur.execute("DELETE FROM processos WHERE cnj=?", (cnj,))
+            total += cur.rowcount or 0
+        conn.commit()
+    return {"deleted_orphan_processes": total, "cnjs": cnjs}
+
+
+def _extract_remote_monitor_rows(payload: Any) -> list[dict]:
+    rows = extract_list(payload)
+    if not rows and isinstance(payload, dict):
+        for key in ("monitoramentos", "data", "items", "results"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                rows = val
+                break
+    out = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        monitor_id = item.get("id")
+        cnj = (item.get("numero") or item.get("numero_cnj") or item.get("cnj") or "").strip()
+        out.append({"id": monitor_id, "cnj": cnj, "raw": item})
+    return out
+
+
+@app.get("/admin/monitoramentos/local")
+def admin_monitoramentos_local_json():
+    return jsonify({"ok": True, "items": _list_local_monitoramentos(), "watchlist": _list_watchlist_local()})
+
+
+@app.post("/admin/monitoramentos/local/processo/cleanup")
+def admin_monitoramentos_local_cleanup_processo():
+    payload = request.get_json(force=True, silent=True) or {}
+    cnj = (payload.get("cnj") or request.form.get("cnj") or "").strip()
+    if not cnj:
+        return jsonify({"ok": False, "error": "CNJ é obrigatório."}), 400
+    return jsonify({"ok": True, **_cleanup_local_processo(cnj)})
+
+
+@app.post("/admin/monitoramentos/local/doc/cleanup")
+def admin_monitoramentos_local_cleanup_doc():
+    payload = request.get_json(force=True, silent=True) or {}
+    doc = (payload.get("doc") or request.form.get("doc") or "").strip()
+    if not doc:
+        return jsonify({"ok": False, "error": "Doc é obrigatório."}), 400
+    return jsonify({"ok": True, **_cleanup_local_doc(doc)})
+
+
+@app.post("/admin/monitoramentos/local/orfaos/cleanup")
+def admin_monitoramentos_local_cleanup_orfaos():
+    return jsonify({"ok": True, **_cleanup_local_orfaos()})
+
+
+@app.get("/admin/monitoramentos/remote")
+def admin_monitoramentos_remote_list():
+    require_token_configured()
+    try:
+        payload = client.listar_monitoramentos_processos(limit=100, page=1)  # type: ignore
+        return jsonify({"ok": True, "items": _extract_remote_monitor_rows(payload), "raw": payload})
+    except EscavadorUnauthorized as e:
+        return jsonify({"ok": False, "error": f"Token sem autorização para listar monitoramentos: {e}"}), 403
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/admin/monitoramentos/remote/remove")
+def admin_monitoramentos_remote_remove():
+    require_token_configured()
+    payload = request.get_json(force=True, silent=True) or {}
+    mid = payload.get("id") or request.form.get("id")
+    if mid in (None, ""):
+        return jsonify({"ok": False, "error": "ID do monitoramento é obrigatório."}), 400
+    try:
+        client.remover_monitoramento_processo(int(mid))  # type: ignore
+        return jsonify({"ok": True, "removed_id": int(mid)})
+    except EscavadorUnauthorized as e:
+        return jsonify({"ok": False, "error": f"Token sem autorização para remover monitoramentos: {e}"}), 403
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/admin/monitoramentos/local/monitorar-cnj")
+def admin_monitoramentos_local_monitorar_cnj():
+    require_token_configured()
+    payload = request.get_json(force=True, silent=False) or {}
+    cnj_in = (payload.get("cnj") or "").strip()
+    if not cnj_in:
+        return jsonify({"ok": False, "error": "CNJ é obrigatório."}), 400
+    try:
+        cnj = normalize_cnj(cnj_in)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+    escavador_status = "created"
+    escavador_detail = None
+    try:
+        client.criar_monitor_processo(cnj)  # type: ignore
+    except EscavadorAlreadyMonitored as e:
+        escavador_status = "already_monitored"
+        escavador_detail = str(e)
+    except EscavadorUnauthorized as e:
+        return jsonify({"ok": False, "error": f"Token sem autorização para monitorar o CNJ: {e}"}), 403
+    except requests.HTTPError as e:
+        resp = getattr(e, "response", None)
+        detail = None
+        try:
+            detail = resp.text if resp is not None else str(e)
+        except Exception:
+            detail = str(e)
+        return jsonify({"ok": False, "error": "Falha ao criar monitoramento no Escavador.", "detail": detail}), 502
+
+    with sqlite3.connect(DB_PATH) as conn:
+        upsert_processo(conn, cnj)
+        cur = conn.cursor()
+        cur.execute("UPDATE processos SET last_sync_at=COALESCE(last_sync_at, ? ) WHERE cnj=?", (utcnow_iso(), cnj))
+        conn.commit()
+
+    synced_events = None
+    sync_error = None
+    try:
+        st = sync_process_movements(client, cnj, limit=100)  # type: ignore
+        synced_events = st.new_events
+    except Exception as e:
+        sync_error = str(e)
+        logger.warning("Monitorar CNJ %s: não foi possível sincronizar movimentações iniciais: %s", cnj, sync_error)
+
+    return jsonify({
+        "ok": True,
+        "cnj": cnj,
+        "escavador_status": escavador_status,
+        "escavador_detail": escavador_detail,
+        "synced_events": synced_events,
+        "sync_error": sync_error,
+    })
+
+
+@app.get("/ui/admin/monitoramentos")
+def ui_admin_monitoramentos():
+    local_items = _list_local_monitoramentos()
+    watch_items = _list_watchlist_local()
+
+    local_rows = ""
+    for item in local_items:
+        badge = "<span class='badge text-bg-warning'>Órfão local</span>" if item.get("is_orfao_local") else "<span class='badge text-bg-success'>Vinculado</span>"
+        docs = ", ".join(item.get("docs") or []) or "—"
+        search_text = esc((((item.get("cnj") or "") + " " + docs).lower()))
+        detail_href = f"/ui/processo/{quote(str(item.get('cnj') or ''))}"
+        timeline_href = f"/processos/{quote(str(item.get('cnj') or ''))}/movimentacoes?limit=25&offset=0"
+        docs_href = f"/processos/{quote(str(item.get('cnj') or ''))}/docs"
+        local_rows += f"""
+        <tr data-search='{search_text}'>
+          <td class='mono small'><a href='{detail_href}'>{esc(item.get('cnj'))}</a></td>
+          <td>{badge}</td>
+          <td class='small'>{esc(docs)}</td>
+          <td class='text-end mono small'>{int(item.get('links_count') or 0)}</td>
+          <td class='text-end mono small'>{int(item.get('eventos_count') or 0)}</td>
+          <td class='mono small'>{esc((item.get('last_sync_at') or item.get('created_at') or '')[:19]).replace('T',' ')}</td>
+          <td class='text-end'>
+            <div class='btn-group btn-group-sm'>
+              <a class='btn btn-outline-primary' href='{detail_href}'>Ver detalhes</a>
+              <a class='btn btn-outline-secondary' href='{timeline_href}' target='_blank'>JSON movs</a>
+              <a class='btn btn-outline-secondary' href='{docs_href}' target='_blank'>JSON docs</a>
+              <button class='btn btn-outline-danger' onclick="cleanupProcess('{esc(item.get('cnj'))}')">Limpar local</button>
+            </div>
+          </td>
+        </tr>
+        """
+    if not local_rows:
+        local_rows = "<tr><td colspan='7' class='muted'>Nenhum processo local encontrado.</td></tr>"
+
+    watch_rows = ""
+    for item in watch_items:
+        watch_rows += f"""
+        <tr>
+          <td class='mono small'>{esc(item.get('doc'))}</td>
+          <td>{esc(item.get('tipo_doc') or '')}</td>
+          <td class='text-end mono small'>{int(item.get('processos_count') or 0)}</td>
+          <td class='mono small'>{esc((item.get('created_at') or '')[:19]).replace('T',' ')}</td>
+          <td class='text-end'><button class='btn btn-sm btn-outline-danger' onclick="cleanupDoc('{esc(item.get('doc'))}')">Limpar local</button></td>
+        </tr>
+        """
+    if not watch_rows:
+        watch_rows = "<tr><td colspan='5' class='muted'>Watchlist vazia.</td></tr>"
+
+    body = f"""
+    <div class='d-flex align-items-center justify-content-between mb-3'>
+      <div>
+        <div class='h4 mb-0'>Admin / Monitoramentos</div>
+        <div class='muted small'>Raio-X dos monitoramentos locais, limpeza profunda e ponte pronta para remover no Escavador.</div>
+      </div>
+      <div class='d-flex gap-2 flex-wrap'>
+        <a class='btn btn-outline-secondary' href='/ui'>Dashboard</a>
+        <a class='btn btn-outline-secondary' href='/ui/watchlist'>Watch-List</a>
+        <a class='btn btn-outline-secondary' href='/ui/admin'>Admin</a>
+        <button class='btn btn-outline-danger' onclick='cleanupOrphans()'>Limpar órfãos locais</button>
+        <button class='btn btn-outline-primary' onclick='loadRemote()'>Carregar remoto</button>
+      </div>
+    </div>
+
+    <div id='adminMsg' class='mb-3'></div>
+
+    <div class='card p-3 mb-3'>
+      <div class='h6 mb-2'>Consulta rápida</div>
+      <div class='muted small mb-3'>Atalhos para abrir a navegação do Specter sem decorar URL. Digite um CNJ e siga para a página do processo.</div>
+      <div class='row g-3 align-items-end'>
+        <div class='col-lg-6'>
+          <label class='form-label small muted'>Abrir processo por CNJ</label>
+          <input id='quickCnjInput' class='form-control mono' placeholder='1018484-34.2015.8.26.0224'>
+        </div>
+        <div class='col-lg-6'>
+          <div class='d-flex gap-2 flex-wrap'>
+            <button class='btn btn-primary' onclick='openQuickProcess()'>Ver detalhes</button>
+            <button class='btn btn-outline-secondary' onclick='openQuickMovs()'>Movimentações JSON</button>
+            <button class='btn btn-outline-secondary' onclick='openQuickDocs()'>Docs JSON</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class='card p-3 mb-3'>
+      <div class='row g-3 align-items-end'>
+        <div class='col-lg-5'>
+          <div class='h6 mb-2'>Monitorar CNJ diretamente</div>
+          <div class='muted small mb-2'>Cria o monitoramento no Escavador sem passar pela watchlist e grava o CNJ localmente.</div>
+          <label class='form-label small muted'>CNJ</label>
+          <input id='cnjDirectInput' class='form-control mono' placeholder='1018484-34.2015.8.26.0224'>
+        </div>
+        <div class='col-lg-2'>
+          <button class='btn btn-primary w-100' onclick='monitorDirectCnj()'>Monitorar CNJ</button>
+        </div>
+        <div class='col-lg-5'>
+          <div class='h6 mb-2'>Filtrar processos locais</div>
+          <div class='muted small mb-2'>Filtro apenas visual na grade local.</div>
+          <input id='localFilterInput' class='form-control' placeholder='Digite CNJ ou documento vinculado'>
+        </div>
+      </div>
+    </div>
+
+    <div class='card p-3 mb-3'>
+      <div class='h6 mb-2'>Processos locais</div>
+      <div class='table-responsive'>
+        <table class='table table-sm align-middle'>
+          <thead><tr class='muted small'><th>CNJ</th><th>Status</th><th>Docs vinculados</th><th class='text-end'>Links</th><th class='text-end'>Eventos</th><th>Última atividade</th><th class='text-end'>Ações</th></tr></thead>
+          <tbody id='localRows'>{local_rows}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class='card p-3 mb-3'>
+      <div class='h6 mb-2'>Watchlist local</div>
+      <div class='table-responsive'>
+        <table class='table table-sm align-middle'>
+          <thead><tr class='muted small'><th>Doc</th><th>Tipo</th><th class='text-end'>Processos</th><th>Criado em</th><th class='text-end'>Ações</th></tr></thead>
+          <tbody>{watch_rows}</tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class='card p-3'>
+      <div class='d-flex align-items-center justify-content-between mb-2'>
+        <div class='h6 mb-0'>Monitoramentos remotos no Escavador</div>
+        <div class='muted small'>Usa <code>GET /monitoramentos/processos</code> e <code>DELETE /monitoramentos/processos/{{id}}</code>.</div>
+      </div>
+      <div class='table-responsive'>
+        <table class='table table-sm align-middle'>
+          <thead><tr class='muted small'><th>ID remoto</th><th>CNJ</th><th class='text-end'>Ações</th></tr></thead>
+          <tbody id='remoteRows'><tr><td colspan='3' class='muted'>Clique em <b>Carregar remoto</b> para consultar o Escavador.</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <script>
+    function msg(kind, html){{
+      const el = document.getElementById('adminMsg');
+      const cls = kind==='ok' ? 'alert alert-success' : (kind==='warn' ? 'alert alert-warning' : 'alert alert-danger');
+      el.innerHTML = `<div class="${{cls}}">${{html}}</div>`;
+    }}
+
+    async function postJson(url, payload){{
+      const r = await fetch(url, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(payload||{{}})}});
+      const j = await r.json();
+      if(!r.ok || !j.ok) throw new Error(j.error || `Falha em ${{url}}`);
+      return j;
+    }}
+
+    async function cleanupProcess(cnj){{
+      if(!confirm(`Limpar localmente o processo ${{cnj}}? Isso remove vínculos, eventos e caches locais.`)) return;
+      try {{
+        const j = await postJson('/admin/monitoramentos/local/processo/cleanup', {{cnj}});
+        msg('ok', `Processo <b>${{cnj}}</b> limpo localmente.`);
+        setTimeout(()=>location.reload(), 300);
+      }} catch(ex) {{ msg('err', ex.message); }}
+    }}
+
+    async function cleanupDoc(doc){{
+      if(!confirm(`Limpar localmente o doc ${{doc}}? Isso remove watchlist, vínculos e órfãos gerados.`)) return;
+      try {{
+        const j = await postJson('/admin/monitoramentos/local/doc/cleanup', {{doc}});
+        msg('ok', `Documento <b>${{doc}}</b> limpo localmente.`);
+        setTimeout(()=>location.reload(), 300);
+      }} catch(ex) {{ msg('err', ex.message); }}
+    }}
+
+    async function cleanupOrphans(){{
+      if(!confirm('Remover todos os processos órfãos locais?')) return;
+      try {{
+        const j = await postJson('/admin/monitoramentos/local/orfaos/cleanup', {{}});
+        msg('ok', `Órfãos removidos: <b>${{j.deleted_orphan_processes || 0}}</b>.`);
+        setTimeout(()=>location.reload(), 300);
+      }} catch(ex) {{ msg('err', ex.message); }}
+    }}
+
+    async function loadRemote(){{
+      const tbody = document.getElementById('remoteRows');
+      tbody.innerHTML = `<tr><td colspan='3' class='muted'>Consultando Escavador...</td></tr>`;
+      try {{
+        const r = await fetch('/admin/monitoramentos/remote');
+        const j = await r.json();
+        if(!r.ok || !j.ok) throw new Error(j.error || 'Falha ao consultar remoto');
+        const items = j.items || [];
+        if(!items.length) {{
+          tbody.innerHTML = `<tr><td colspan='3' class='muted'>Nenhum monitoramento remoto retornado.</td></tr>`;
+          return;
+        }}
+        tbody.innerHTML = items.map(it => `
+          <tr>
+            <td class='mono small'>${{it.id ?? ''}}</td>
+            <td class='mono small'>${{it.cnj || '—'}}</td>
+            <td class='text-end'><button class='btn btn-sm btn-outline-danger' onclick='removeRemote(${{it.id}}, "${{(it.cnj||'').replace(/"/g,'&quot;')}}")'>Remover no Escavador</button></td>
+          </tr>`).join('');
+      }} catch(ex) {{
+        tbody.innerHTML = `<tr><td colspan='3' class='text-danger'>${{ex.message}}</td></tr>`;
+      }}
+    }}
+
+    async function removeRemote(id, cnj){{
+      if(!confirm(`Remover o monitoramento remoto ID ${{id}}${{cnj ? ' do CNJ ' + cnj : ''}}?`)) return;
+      try {{
+        await postJson('/admin/monitoramentos/remote/remove', {{id}});
+        msg('ok', `Monitoramento remoto <b>${{id}}</b> removido.`);
+        loadRemote();
+      }} catch(ex) {{ msg('err', ex.message); }}
+    }}
+
+    function getQuickCnj(){{
+      const v = (document.getElementById('quickCnjInput')?.value || document.getElementById('cnjDirectInput')?.value || '').trim();
+      if(!v){{ msg('warn', 'Informe um CNJ para consultar.'); return ''; }}
+      return v;
+    }}
+
+    function openQuickProcess(){{
+      const cnj = getQuickCnj();
+      if(!cnj) return;
+      window.location.href = '/ui/processo/' + encodeURIComponent(cnj);
+    }}
+
+    function openQuickMovs(){{
+      const cnj = getQuickCnj();
+      if(!cnj) return;
+      window.open('/processos/' + encodeURIComponent(cnj) + '/movimentacoes?limit=25&offset=0', '_blank');
+    }}
+
+    function openQuickDocs(){{
+      const cnj = getQuickCnj();
+      if(!cnj) return;
+      window.open('/processos/' + encodeURIComponent(cnj) + '/docs', '_blank');
+    }}
+
+    async function monitorDirectCnj(){{
+      const el = document.getElementById('cnjDirectInput');
+      const cnj = (el.value || '').trim();
+      if(!cnj){{ msg('warn', 'Informe um CNJ para monitorar.'); return; }}
+      try {{
+        const j = await postJson('/admin/monitoramentos/local/monitorar-cnj', {{cnj}});
+        let extra = '';
+        if(j.escavador_status === 'already_monitored') extra += ' O Escavador informou que ele já estava sendo monitorado.';
+        if(j.synced_events !== null && j.synced_events !== undefined) extra += ` Movimentações novas sincronizadas: <b>${{j.synced_events}}</b>.`;
+        if(j.sync_error) extra += ` <span class='text-warning'>Sincronização inicial parcial: ${{j.sync_error}}</span>`;
+        extra += ` <a href="/ui/processo/${{encodeURIComponent(j.cnj)}}" class="alert-link">Abrir detalhes do processo</a>.`;
+        msg('ok', `CNJ <b>${{j.cnj}}</b> registrado no Specter.${{extra}}`);
+        const quick = document.getElementById('quickCnjInput');
+        if(quick) quick.value = j.cnj || '';
+        el.value = '';
+        setTimeout(()=>location.reload(), 900);
+      }} catch(ex) {{ msg('err', ex.message); }}
+    }}
+
+    function applyLocalFilter(){{
+      const q = (document.getElementById('localFilterInput').value || '').trim().toLowerCase();
+      const rows = Array.from(document.querySelectorAll('#localRows tr'));
+      let visible = 0;
+      rows.forEach(tr => {{
+        const hay = (tr.getAttribute('data-search') || tr.innerText || '').toLowerCase();
+        const show = !q || hay.includes(q);
+        tr.style.display = show ? '' : 'none';
+        if(show) visible++;
+      }});
+    }}
+
+    document.getElementById('localFilterInput')?.addEventListener('input', applyLocalFilter);
+    </script>
+    """
+    return render_template_string(UI_BASE, body=body)
 
 
 @app.get("/ui/dashboard")
