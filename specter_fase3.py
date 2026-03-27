@@ -1408,9 +1408,19 @@ def health():
 # ============================================================
 @app.get("/watchlist")
 def list_watchlist():
+    _ensure_watchlist_status_columns()
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("SELECT id, doc, tipo_doc, created_at FROM watchlist ORDER BY id DESC LIMIT 500")
+    cur.execute("""
+        SELECT
+            id, doc, tipo_doc, created_at,
+            COALESCE(remote_status,'') AS remote_status,
+            COALESCE(remote_detail,'') AS remote_detail,
+            COALESCE(remote_last_try_at,'') AS remote_last_try_at
+        FROM watchlist
+        ORDER BY id DESC
+        LIMIT 500
+    """)
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return jsonify({"ok": True, "count": len(rows), "items": rows})
@@ -1418,7 +1428,6 @@ def list_watchlist():
 
 @app.post("/watchlist")
 def create_watchlist():
-    require_token_configured()
     payload = request.get_json(force=True, silent=False) or {}
     doc_in = (payload.get("doc") or "").strip()
     if not doc_in:
@@ -1429,22 +1438,140 @@ def create_watchlist():
         abort(400, description=str(e))
     tipo = doc_type(doc)
 
-    api_resp: Dict[str, Any]
-    try:
-        api_resp = client.criar_monitor_novos_processos(doc)  # type: ignore
-    except requests.HTTPError as e:
-        api_resp = {"warning": "monitoramento pode já existir", "detail": str(e)}
+    _ensure_watchlist_status_columns()
 
+    # Salva localmente primeiro, mesmo se o remoto falhar
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO watchlist (doc, tipo_doc, created_at) VALUES (?, ?, ?)", (doc, tipo, utcnow_iso()))
+    cur.execute(
+        """
+        INSERT INTO watchlist (doc, tipo_doc, created_at, remote_status, remote_detail, remote_last_try_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(doc) DO UPDATE SET
+            tipo_doc=excluded.tipo_doc
+        """,
+        (doc, tipo, utcnow_iso(), "pending", "", utcnow_iso())
+    )
     conn.commit()
     cur.execute("SELECT id FROM watchlist WHERE doc=?", (doc,))
     row = cur.fetchone()
+
+    api_resp: Dict[str, Any] = {}
+    remote_status = "skipped"
+    remote_detail = ""
+
+    if not ESCAVADOR_TOKEN or client is None:
+        remote_status = "token_missing"
+        remote_detail = "Token do Escavador ausente. Cadastro salvo localmente."
+    else:
+        try:
+            api_resp = client.criar_monitor_novos_processos(doc)  # type: ignore
+            remote_status = "created"
+            remote_detail = "Monitoramento remoto criado."
+        except requests.exceptions.Timeout as e:
+            api_resp = {"warning": "timeout", "detail": str(e)}
+            remote_status = "timeout"
+            remote_detail = "Timeout ao criar monitoramento remoto. Cadastro salvo localmente."
+        except requests.exceptions.ReadTimeout as e:
+            api_resp = {"warning": "timeout", "detail": str(e)}
+            remote_status = "timeout"
+            remote_detail = "Timeout ao criar monitoramento remoto. Cadastro salvo localmente."
+        except requests.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            body = ""
+            try:
+                body = getattr(e.response, "text", "") or ""
+            except Exception:
+                body = ""
+            api_resp = {"warning": "http_error", "status": status, "detail": str(e), "body": body}
+            if status == 422 and ("já monitora" in body.lower() or "ja monitora" in body.lower()):
+                remote_status = "already_exists"
+                remote_detail = "O Escavador já monitorava esse documento."
+            else:
+                remote_status = "http_error"
+                remote_detail = f"Falha HTTP no remoto: {status or '?'}."
+        except Exception as e:
+            api_resp = {"warning": "remote_error", "detail": str(e)}
+            remote_status = "error"
+            remote_detail = f"Falha ao sincronizar remoto: {e}"
+
+    cur.execute(
+        "UPDATE watchlist SET remote_status=?, remote_detail=?, remote_last_try_at=? WHERE doc=?",
+        (remote_status, remote_detail[:1000], utcnow_iso(), doc)
+    )
+    conn.commit()
     conn.close()
 
-    return jsonify({"ok": True, "id": row["id"] if row else None, "doc": doc, "tipo_doc": tipo, "escavador": api_resp})
+    return jsonify({
+        "ok": True,
+        "id": row["id"] if row else None,
+        "doc": doc,
+        "tipo_doc": tipo,
+        "saved_local": True,
+        "remote_status": remote_status,
+        "remote_detail": remote_detail,
+        "escavador": api_resp
+    })
 
+
+@app.post("/watchlist/retry-remote")
+def watchlist_retry_remote():
+    payload = request.get_json(force=True, silent=True) or {}
+    doc_in = (payload.get("doc") or "").strip()
+    if not doc_in:
+        return jsonify({"ok": False, "error": "Doc é obrigatório."}), 400
+    try:
+        doc = normalize_doc(doc_in)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+    _ensure_watchlist_status_columns()
+
+    if not ESCAVADOR_TOKEN or client is None:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE watchlist SET remote_status=?, remote_detail=?, remote_last_try_at=? WHERE doc=?",
+                    ("token_missing", "Token do Escavador ausente.", utcnow_iso(), doc))
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": False, "error": "Token do Escavador ausente.", "doc": doc}), 400
+
+    api_resp = {}
+    remote_status = "created"
+    remote_detail = "Monitoramento remoto criado."
+    try:
+        api_resp = client.criar_monitor_novos_processos(doc)  # type: ignore
+    except requests.exceptions.Timeout as e:
+        api_resp = {"warning": "timeout", "detail": str(e)}
+        remote_status = "timeout"
+        remote_detail = "Timeout ao criar monitoramento remoto."
+    except requests.HTTPError as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        body = ""
+        try:
+            body = getattr(e.response, "text", "") or ""
+        except Exception:
+            body = ""
+        api_resp = {"warning": "http_error", "status": status, "detail": str(e), "body": body}
+        if status == 422 and ("já monitora" in body.lower() or "ja monitora" in body.lower()):
+            remote_status = "already_exists"
+            remote_detail = "O Escavador já monitorava esse documento."
+        else:
+            remote_status = "http_error"
+            remote_detail = f"Falha HTTP no remoto: {status or '?'}."
+    except Exception as e:
+        api_resp = {"warning": "remote_error", "detail": str(e)}
+        remote_status = "error"
+        remote_detail = f"Falha ao sincronizar remoto: {e}"
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE watchlist SET remote_status=?, remote_detail=?, remote_last_try_at=? WHERE doc=?",
+                (remote_status, remote_detail[:1000], utcnow_iso(), doc))
+    conn.commit()
+    conn.close()
+
+    return jsonify({"ok": True, "doc": doc, "remote_status": remote_status, "remote_detail": remote_detail, "escavador": api_resp})
 
 @app.delete("/watchlist/<int:watch_id>")
 def delete_watchlist_by_id(watch_id: int):
@@ -5610,6 +5737,39 @@ def ui_watchlist():
 
       function normalizeDoc(s){ return String(s||"").trim(); }
 
+      function watchStatusLabel(s){
+        const map = {
+          created: "Remoto OK",
+          already_exists: "Já existe no Escavador",
+          timeout: "Timeout remoto",
+          http_error: "Falha remota",
+          error: "Erro remoto",
+          token_missing: "Sem token",
+          pending: "Pendente",
+          skipped: "Sem sync remoto"
+        };
+        return map[String(s||"")] || String(s||"");
+      }
+      function watchStatusClass(s){
+        const map = {
+          created: "text-bg-success",
+          already_exists: "text-bg-info",
+          timeout: "text-bg-warning",
+          http_error: "text-bg-danger",
+          error: "text-bg-danger",
+          token_missing: "text-bg-secondary",
+          pending: "text-bg-light",
+          skipped: "text-bg-secondary"
+        };
+        return map[String(s||"")] || "text-bg-light";
+      }
+      function renderRemoteInfo(d){
+        const parts = [];
+        if(d.remote_detail){ parts.push(`<span class="muted">${esc(d.remote_detail)}</span>`); }
+        if(d.remote_last_try_at){ parts.push(`<span class="chip">Últ. tentativa: ${esc(String(d.remote_last_try_at).replace("T"," ").slice(0,19))}</span>`); }
+        return parts.join(" ");
+      }
+
       async function loadWatchlist(){
         const wlDiv = document.getElementById("wl");
         const acc = document.getElementById("wlAcc");
@@ -5640,16 +5800,16 @@ def ui_watchlist():
               <h2 class="accordion-header" id="${hid}">
                 <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#${cid}" aria-expanded="false" aria-controls="${cid}">
                   <span class="fw-semibold">${esc(doc)}</span>
-                  <span class="ms-2 badge text-bg-light">${esc(d.tipo_doc||"")}</span>
+                  <span class="ms-2 badge text-bg-light">${esc(d.tipo_doc||"")}</span>\n                  ${d.remote_status ? `<span class="ms-2 badge ${watchStatusClass(d.remote_status)}">${esc(watchStatusLabel(d.remote_status))}</span>` : ""}
                 </button>
               </h2>
               <div id="${cid}" class="accordion-collapse collapse" aria-labelledby="${hid}" data-bs-parent="#wlAcc">
                 <div class="accordion-body">
                   <div class="d-flex flex-wrap gap-2 mb-2">
                     <button class="btn btn-sm btn-primary" data-action="discover" data-doc="${esc(doc)}">Descobrir</button>
-                    <button class="btn btn-sm btn-outline-primary" data-action="refresh" data-doc="${esc(doc)}">Atualizar lista</button>
+                    <button class="btn btn-sm btn-outline-primary" data-action="refresh" data-doc="${esc(doc)}">Atualizar lista</button>\n                    <button class="btn btn-sm btn-outline-warning" data-action="retry-remote" data-doc="${esc(doc)}">Tentar remoto</button>
                   </div>
-                  <div class="small muted mb-1">Processos vinculados</div>
+                  <div class="small muted mb-1">Processos vinculados</div>\n                  <div class="small mb-2">${renderRemoteInfo(d)}</div>
                   <div class="small" data-procs="${esc(doc)}">Carregando…</div>
                 </div>
               </div>
@@ -5667,6 +5827,19 @@ def ui_watchlist():
               await loadDocProcs(doc);
             }catch(e){
               if(window.showToast) showToast("danger","Discover falhou", e.message);
+            }finally{ btn.disabled=false; }
+          });
+        });
+        acc.querySelectorAll('[data-action="retry-remote"]').forEach(btn=>{
+          btn.addEventListener("click", async ()=>{
+            const doc = btn.getAttribute("data-doc");
+            btn.disabled=true;
+            try{
+              const j = await apiJson('/watchlist/retry-remote', {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({doc})});
+              if(window.showToast) showToast("success","Watch-List", `Remoto de ${doc}: ${j.remote_detail || j.remote_status}`);
+              await loadWatchlist();
+            }catch(e){
+              if(window.showToast) showToast("danger","Sync remoto falhou", e.message);
             }finally{ btn.disabled=false; }
           });
         });
@@ -5715,8 +5888,10 @@ def ui_watchlist():
         status.textContent = "";
         if(!doc){ status.textContent="Informe um CPF/CNPJ."; return; }
         try{
-          await apiJson("/watchlist", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({doc})});
-          if(window.showToast) showToast("success","Watch-List","Doc adicionado.");
+          const j = await apiJson("/watchlist", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({doc})});
+          const detail = j.remote_detail || "";
+          status.textContent = `Salvo localmente. Status remoto: ${j.remote_status || "n/d"}. ${detail}`;
+          if(window.showToast) showToast("success","Watch-List", `Doc salvo localmente. ${detail || ("Status remoto: " + (j.remote_status||"n/d"))}`);
           document.getElementById("docInput").value="";
           await loadWatchlist();
         }catch(e){
@@ -6455,6 +6630,19 @@ def _list_local_monitoramentos() -> list[dict]:
         return rows
 
 
+
+def _ensure_watchlist_status_columns():
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(watchlist)").fetchall()}
+        if "remote_status" not in cols:
+            cur.execute("ALTER TABLE watchlist ADD COLUMN remote_status TEXT")
+        if "remote_detail" not in cols:
+            cur.execute("ALTER TABLE watchlist ADD COLUMN remote_detail TEXT")
+        if "remote_last_try_at" not in cols:
+            cur.execute("ALTER TABLE watchlist ADD COLUMN remote_last_try_at TEXT")
+        conn.commit()
+
 def _list_watchlist_local() -> list[dict]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -6462,10 +6650,13 @@ def _list_watchlist_local() -> list[dict]:
         cur.execute("""
             SELECT
                 w.id, w.doc, w.tipo_doc, w.created_at,
+                COALESCE(w.remote_status, '') AS remote_status,
+                COALESCE(w.remote_detail, '') AS remote_detail,
+                COALESCE(w.remote_last_try_at, '') AS remote_last_try_at,
                 COUNT(DISTINCT dp.cnj) AS processos_count
             FROM watchlist w
             LEFT JOIN doc_process dp ON dp.doc = w.doc
-            GROUP BY w.id, w.doc, w.tipo_doc, w.created_at
+            GROUP BY w.id, w.doc, w.tipo_doc, w.created_at, w.remote_status, w.remote_detail, w.remote_last_try_at
             ORDER BY w.id DESC
         """)
         return [dict(r) for r in cur.fetchall()]
